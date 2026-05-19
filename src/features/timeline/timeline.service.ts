@@ -1,0 +1,68 @@
+import { TimelineRepository } from './timeline.repository.js';
+import { AppError } from '../../core/middlewares/error.middleware.js';
+
+export class TimelineService {
+  static async getTimeline(userId: string) {
+    const memories = await TimelineRepository.getRecentMemories(userId, 50);
+
+    const enriched = await Promise.all(memories.map(async (mem) => {
+      const projectName = await TimelineRepository.getProjectForMemory(mem.id);
+      const meta = mem.metadata as any;
+      return {
+        ...mem,
+        project: projectName,
+        rawContent: meta?.rawContent || null,
+        sentiment: meta?.sentiment || 'neutral',
+        moodScore: meta?.moodScore || 5,
+      };
+    }));
+
+    return enriched;
+  }
+
+  static async getResurfaced(userId: string) {
+    const raw = await TimelineRepository.getResurfacedMemories(userId);
+    return raw.map((r: any) => ({
+      id: r.id,
+      content: r.content,
+      createdAt: r.created_at,
+      daysAgo: Math.round((Date.now() - new Date(r.created_at).getTime()) / (1000 * 60 * 60 * 24)),
+    }));
+  }
+
+  static async getMemoryDetail(userId: string, memoryId: string) {
+    if (!memoryId) throw new AppError('Missing memory id', 400);
+
+    const memory = await TimelineRepository.getMemoryById(userId, memoryId);
+    if (!memory) throw new AppError('Memory not found', 404);
+
+    const connections = await TimelineRepository.getMemoryConnections(memoryId);
+    const entities = connections.filter(r => r.node_type === 'entity').map(r => r.content);
+    const project = connections.find(r => r.node_type === 'project')?.content || null;
+
+    let relatedMemories: any[] = [];
+    if (memory.embedding) {
+      relatedMemories = await TimelineRepository.getSimilarMemories(userId, memoryId, memory.embedding);
+    }
+
+    const meta = memory.metadata as any;
+    return {
+      memory: {
+        id: memory.id,
+        content: memory.content,
+        rawContent: meta?.rawContent || memory.content,
+        sentiment: meta?.sentiment || 'neutral',
+        moodScore: meta?.moodScore || 5,
+        project,
+        entities,
+        createdAt: memory.createdAt,
+        relatedMemories,
+      }
+    };
+  }
+
+  static async deleteMemory(memoryId: string) {
+    if (!memoryId) throw new AppError('Missing memory id', 400);
+    await TimelineRepository.deleteMemory(memoryId);
+  }
+}

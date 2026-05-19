@@ -1,9 +1,10 @@
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
-import * as schema from './schema.ts';
+import * as schema from './schema.js';
+import { env } from '../config/env.js';
 
 const pool = new Pool({
-  connectionString: 'postgres://aion_user:aion_password@localhost:5432/aion_db',
+  connectionString: env.DATABASE_URL,
 });
 
 export const db = drizzle(pool, { schema });

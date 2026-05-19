@@ -1,12 +1,9 @@
-import { db } from './db/index.ts';
-import { events, nodes, edges } from './db/schema.ts';
+import { db } from '../db/index.js';
+import { events, nodes, edges } from '../db/schema.js';
 import { sql } from 'drizzle-orm';
-import { llm } from './services/llm.service.ts';
-import dotenv from 'dotenv';
+import { llm } from '../services/llm.service.js';
+import { env } from '../config/env.js';
 
-dotenv.config();
-
-// Utility: delay for general backoff
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export const startWorker = () => {
@@ -22,8 +19,7 @@ export const startWorker = () => {
 };
 
 async function processPendingEvents() {
-  // If provider is gemini but no key, warn and pause.
-  if (process.env.LLM_PROVIDER === 'gemini' && !process.env.GEMINI_API_KEY) {
+  if (process.env.LLM_PROVIDER === 'gemini' && !env.GEMINI_API_KEY) {
     console.error('GEMINI_API_KEY is not set but LLM_PROVIDER is gemini. Worker paused.');
     return;
   }
@@ -49,7 +45,6 @@ async function processPendingEvents() {
     console.log(`Processing event ${eventId}...`);
     
     try {
-      // 1. Generate Summary, Entities, and Project via Gemini
       const promptInstruction = `
         Return a JSON object with exactly these fields:
         - summary: A concise summary of the thought.
@@ -83,11 +78,8 @@ async function processPendingEvents() {
       }
       
       const parsed = JSON.parse(aiResponse);
-
-      // 2. Generate Embedding
       const embeddingVector = await llm.embedContent(parsed.summary);
 
-      // 3. Database Transaction
       await db.transaction(async (tx) => {
         const [memoryNode] = await tx.insert(nodes).values({
           userId,
@@ -102,11 +94,8 @@ async function processPendingEvents() {
           }
         }).returning();
 
-        if (!memoryNode) {
-          throw new Error('Failed to insert memory node');
-        }
+        if (!memoryNode) throw new Error('Failed to insert memory node');
 
-        // Helper: resolve or create a node (deduplication)
         const resolveNode = async (nodeType: string, content: string) => {
           const existing = await tx.execute(sql`
             SELECT id FROM nodes 
@@ -114,9 +103,7 @@ async function processPendingEvents() {
             LIMIT 1
           `);
           
-          if (existing?.rows?.length > 0) {
-            return existing?.rows?.[0]?.id as string;
-          }
+          if (existing?.rows?.length > 0) return existing?.rows?.[0]?.id as string;
           
           const [newNode] = await tx.insert(nodes).values({
             userId,
@@ -124,14 +111,10 @@ async function processPendingEvents() {
             content
           }).returning();
           
-          if (!newNode) {
-            throw new Error('Failed to insert node');
-          }
-
+          if (!newNode) throw new Error('Failed to insert node');
           return newNode.id;
         };
 
-        // Link Project Node
         if (parsed.project) {
           const projectId = await resolveNode('project', parsed.project);
           await tx.insert(edges).values({
@@ -141,7 +124,6 @@ async function processPendingEvents() {
           });
         }
 
-        // Link Entity Nodes
         if (parsed.entities && Array.isArray(parsed.entities)) {
           for (const entity of parsed.entities) {
             const entityId = await resolveNode('entity', entity);
@@ -153,7 +135,6 @@ async function processPendingEvents() {
           }
         }
 
-        // Link Person Nodes (Relationship Graph)
         if (parsed.people && Array.isArray(parsed.people)) {
           for (const person of parsed.people) {
             const personId = await resolveNode('person', person);
@@ -165,7 +146,6 @@ async function processPendingEvents() {
           }
         }
 
-        // Mark as processed
         await tx.insert(events).values({
           userId,
           eventType: 'memory_processed',

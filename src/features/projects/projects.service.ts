@@ -1,0 +1,27 @@
+import { ProjectsRepository } from './projects.repository.js';
+import { AppError } from '../../core/middlewares/error.middleware.js';
+
+export class ProjectsService {
+  static async getProjects(userId: string) {
+    const projects = await ProjectsRepository.getProjects(userId);
+
+    const enriched = await Promise.all(projects.map(async (proj) => {
+      const linkedMemories = await ProjectsRepository.getLinkedMemories(proj.id);
+      const linkedEntities = await ProjectsRepository.getLinkedEntities(proj.id);
+
+      return {
+        ...proj,
+        memoryCount: linkedMemories.rows.length,
+        memories: linkedMemories.rows,
+        entities: linkedEntities.rows.map((r: any) => r.content),
+      };
+    }));
+
+    return enriched;
+  }
+
+  static async moveMemoryToProject(memoryId: string, newProjectName: string, userId: string) {
+    if (!memoryId || !newProjectName) throw new AppError('Missing memoryId or newProjectName', 400);
+    await ProjectsRepository.moveMemoryToProject(memoryId, newProjectName, userId);
+  }
+}
