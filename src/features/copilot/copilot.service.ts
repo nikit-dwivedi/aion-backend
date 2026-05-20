@@ -7,10 +7,10 @@ export class CopilotService {
   static async generateInsights(userId: string) {
     if (!env.GEMINI_API_KEY) throw new AppError('GEMINI_API_KEY not configured.', 500);
 
-    const recentMemories = await CopilotRepository.getRecentMemories(30);
+    const recentMemories = await CopilotRepository.getRecentMemories(userId, 30);
     if (recentMemories.length < 3) return [];
 
-    const allProjects = await CopilotRepository.getAllProjects();
+    const allProjects = await CopilotRepository.getAllProjects(userId);
     const memoriesText = recentMemories.map((m, i) => `[M${i + 1}] [${m.createdAt?.toISOString?.() ?? ''}] ${m.content}`).join('\n');
     const projectsText = allProjects.map(p => p.content).join(', ');
 
@@ -46,33 +46,47 @@ Output ONLY raw JSON array.`;
     return enriched;
   }
 
-  static async getInsights() {
-    const insightNodes = await CopilotRepository.getInsights(20);
+  static async getInsights(userId: string) {
+    const insightNodes = await CopilotRepository.getInsights(userId, 20);
     return insightNodes.map(n => {
       try { return { id: n.id, ...JSON.parse(n.content), createdAt: n.createdAt }; }
       catch { return { id: n.id, type: 'pattern', title: 'Insight', body: n.content, createdAt: n.createdAt }; }
     });
   }
 
-  static async getNudge() {
-    const insightNodes = await CopilotRepository.getInsights(10);
-    if (insightNodes.length === 0) return null;
+  static async getNudge(userId: string) {
+    if (!env.GEMINI_API_KEY) return null;
 
-    const randomInsight = insightNodes[Math.floor(Math.random() * insightNodes.length)];
-    if (!randomInsight) return null;
+    const recentMemories = await CopilotRepository.getRecentMemories(userId, 5);
+    if (recentMemories.length === 0) return null;
+
+    const memCtx = recentMemories.map((m, i) => `${i + 1}. ${m.content}`).join('\n');
     
+    const prompt = `You are AION, a cognitive copilot. 
+Analyze these 5 recent thoughts from the user:
+${memCtx}
+
+Generate a single, deep, provocative "Socratic Question" designed to spark journaling and reflection. 
+It should connect two of their ideas or challenge a contradiction.
+Return a JSON object with exactly two fields:
+- title: A very short hook (e.g. "Focus & Burnout", "Contradiction in goals")
+- body: The socratic question itself (1-2 sentences).
+Output ONLY raw JSON without markdown formatting.`;
+
     try {
-      const parsed = JSON.parse(randomInsight.content);
-      return { title: parsed.title, body: parsed.body };
+      let aiResponse = await llm.generateContent({ prompt });
+      const si = aiResponse.indexOf('{'), ei = aiResponse.lastIndexOf('}');
+      if (si !== -1 && ei !== -1) aiResponse = aiResponse.substring(si, ei + 1);
+      return JSON.parse(aiResponse);
     } catch {
       return null;
     }
   }
 
-  static async chat(message: string, conversationHistory: any[]) {
+  static async chat(userId: string, message: string, conversationHistory: any[]) {
     if (!env.GEMINI_API_KEY) throw new AppError('GEMINI_API_KEY not configured.', 500);
 
-    const recentMemories = await CopilotRepository.getRecentMemories(20);
+    const recentMemories = await CopilotRepository.getRecentMemories(userId, 20);
     const memCtx = recentMemories.map((m, i) => `${i + 1}. ${m.content}`).join('\n');
     const historyText = (conversationHistory || []).map((h: any) => `${h.role === 'user' ? 'User' : 'AION'}: ${h.content}`).join('\n');
 

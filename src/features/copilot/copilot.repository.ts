@@ -1,18 +1,18 @@
 import { db } from '../../db/index.js';
 import { nodes } from '../../db/schema.js';
-import { eq, desc } from 'drizzle-orm';
+import { eq, desc, sql } from 'drizzle-orm';
 
 export class CopilotRepository {
-  static async getRecentMemories(limit = 30) {
+  static async getRecentMemories(userId: string, limit = 30) {
     return await db.select({
       id: nodes.id,
       content: nodes.content,
       createdAt: nodes.createdAt
-    }).from(nodes).where(eq(nodes.nodeType, 'memory')).orderBy(desc(nodes.createdAt)).limit(limit);
+    }).from(nodes).where(sql`${nodes.nodeType} = 'memory' AND ${nodes.userId} = ${userId}`).orderBy(desc(nodes.createdAt)).limit(limit);
   }
 
-  static async getAllProjects() {
-    return await db.select({ content: nodes.content }).from(nodes).where(eq(nodes.nodeType, 'project'));
+  static async getAllProjects(userId: string) {
+    return await db.select({ content: nodes.content }).from(nodes).where(sql`${nodes.nodeType} = 'project' AND ${nodes.userId} = ${userId}`);
   }
 
   static async insertInsight(userId: string, insight: any) {
@@ -24,11 +24,11 @@ export class CopilotRepository {
     });
   }
 
-  static async getInsights(limit = 20) {
+  static async getInsights(userId: string, limit = 20) {
     return await db.select({
       id: nodes.id,
       content: nodes.content,
       createdAt: nodes.createdAt
-    }).from(nodes).where(eq(nodes.nodeType, 'insight')).orderBy(desc(nodes.createdAt)).limit(limit);
+    }).from(nodes).where(sql`${nodes.nodeType} = 'insight' AND ${nodes.userId} = ${userId}`).orderBy(desc(nodes.createdAt)).limit(limit);
   }
 }

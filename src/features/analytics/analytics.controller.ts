@@ -18,4 +18,12 @@ export class AnalyticsController {
     const result = await AnalyticsService.getBehavioralPatterns(userId);
     res.json(result);
   }
+
+  static async getForecast(req: Request, res: Response) {
+    const userId = req.userId;
+    if (!userId) throw new AppError('Unauthorized', 401);
+
+    const forecast = await AnalyticsService.getForecast(userId);
+    res.json({ forecast });
+  }
 }

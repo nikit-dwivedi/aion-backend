@@ -9,5 +9,6 @@ router.use(authMiddleware);
 
 router.get('/focus', asyncHandler(AnalyticsController.getFocusAnalytics));
 router.get('/patterns', asyncHandler(AnalyticsController.getBehavioralPatterns));
+router.get('/forecast', asyncHandler(AnalyticsController.getForecast));
 
 export default router;

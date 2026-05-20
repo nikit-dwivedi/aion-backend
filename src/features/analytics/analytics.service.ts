@@ -1,4 +1,6 @@
 import { AnalyticsRepository } from './analytics.repository.js';
+import { llm } from '../../services/llm.service.js';
+import { env } from '../../config/env.js';
 
 export class AnalyticsService {
   static async getFocusAnalytics(userId: string) {
@@ -60,5 +62,36 @@ export class AnalyticsService {
       recurringConcerns: concerns.rows,
       people: people.rows,
     };
+  }
+
+  static async getForecast(userId: string) {
+    if (!env.GEMINI_API_KEY) return null;
+
+    const sentimentTrend = await AnalyticsRepository.getSentimentTrend(userId);
+    const captureTrend = await AnalyticsRepository.getCaptureTrend(userId);
+    
+    const sentimentStr = JSON.stringify(sentimentTrend.rows);
+    const captureStr = JSON.stringify(captureTrend.rows);
+
+    const prompt = `You are AION's predictive engine. 
+Analyze the user's past 30 days of activity:
+Sentiment Trend: ${sentimentStr}
+Capture Trend: ${captureStr}
+
+Generate a short 7-day "Cognitive Forecast". 
+Return JSON with exactly these fields:
+- title: A short title (e.g. "Creative Surge Expected", "Risk of Burnout")
+- forecast: A 2-sentence prediction of their cognitive state or focus.
+- recommendation: A 1-sentence actionable advice.
+Output ONLY raw JSON.`;
+
+    try {
+      let aiResponse = await llm.generateContent({ prompt });
+      const si = aiResponse.indexOf('{'), ei = aiResponse.lastIndexOf('}');
+      if (si !== -1 && ei !== -1) aiResponse = aiResponse.substring(si, ei + 1);
+      return JSON.parse(aiResponse);
+    } catch {
+      return null;
+    }
   }
 }

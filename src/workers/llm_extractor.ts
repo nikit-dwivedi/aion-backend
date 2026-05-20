@@ -45,14 +45,28 @@ async function processPendingEvents() {
     console.log(`Processing event ${eventId}...`);
     
     try {
+      const recentMems = await db.execute(sql`
+        SELECT content FROM nodes 
+        WHERE node_type = 'memory' AND user_id = ${userId}
+        ORDER BY created_at DESC LIMIT 10
+      `);
+      const recentText = recentMems.rows.map((r, i) => `${i + 1}. ${r.content}`).join('\n');
+
       const promptInstruction = `
+        You are AION, extracting structured metadata from a new thought.
+        Here are the user's recent thoughts for context:
+        ${recentText || 'None'}
+
         Return a JSON object with exactly these fields:
         - summary: A concise summary of the thought.
-        - project: A single string representing the broader project or category this thought belongs to (e.g., "AION Development", "Fitness", "E-commerce App"). Keep it short and generic.
-        - entities: An array of strings representing key specific entities (tools, technologies, locations, concepts).
-        - people: An array of strings representing people mentioned by name (first name, full name, or role like "my manager").
+        - project: A single string representing the broader project or category this thought belongs to. Keep it short.
+        - entities: An array of strings representing key specific entities.
+        - people: An array of strings representing people mentioned by name.
+        - contradictions: An array of strings representing entities or projects that this new thought actively contradicts or reverses based on the context. Empty array if none.
         - sentiment: One of "positive", "neutral", "negative", "anxious", "excited", "reflective".
         - mood_score: An integer from 1 to 10 (1=very negative, 5=neutral, 10=very positive).
+        - requires_research: A boolean. true if this thought mentions a topic, concept, or question that could benefit from web research to provide more context or answer the user's curiosity. false otherwise.
+        - research_query: If requires_research is true, a short web search query string (max 10 words) to find relevant information. null if false.
         Output ONLY raw JSON without markdown formatting.
       `;
 
@@ -146,6 +160,17 @@ async function processPendingEvents() {
           }
         }
 
+        if (parsed.contradictions && Array.isArray(parsed.contradictions)) {
+          for (const contradiction of parsed.contradictions) {
+            const cId = await resolveNode('entity', contradiction);
+            await tx.insert(edges).values({
+              sourceNodeId: memoryNode.id,
+              targetNodeId: cId,
+              relationType: 'contradicts',
+            });
+          }
+        }
+
         await tx.insert(events).values({
           userId,
           eventType: 'memory_processed',
@@ -154,6 +179,17 @@ async function processPendingEvents() {
       });
       
       console.log(`Successfully processed event ${eventId}`);
+
+      // If research is needed, emit a research_requested event for the agent worker
+      if (parsed.requires_research && parsed.research_query) {
+        await db.insert(events).values({
+          userId,
+          eventType: 'research_requested',
+          payload: { query: parsed.research_query, sourceEventId: eventId, sourceSummary: parsed.summary }
+        });
+        console.log(`Research requested: "${parsed.research_query}"`);
+      }
+
       await delay(2000);
     } catch (e) {
       console.error(`Failed to process event ${eventId}:`, e);
