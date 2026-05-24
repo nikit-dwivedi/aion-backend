@@ -1,6 +1,9 @@
 import { PlanningRepository } from './planning.repository.js';
 import { llm } from '../../services/llm.service.js';
 import { AppError } from '../../core/middlewares/error.middleware.js';
+import { db } from '../../db/index.js';
+import { nodes, events } from '../../db/schema.js';
+import { sql } from 'drizzle-orm';
 
 export class PlanningService {
   static async generateBreakdown(userId: string, goal: string) {
@@ -40,9 +43,37 @@ export class PlanningService {
     return breakdown;
   }
 
+  /**
+   * Fetches the persisted daily plan for today. If none exists, generates one on-the-fly.
+   */
   static async generateSchedule(userId: string) {
+    // 1. Try to fetch today's persisted plan (instant)
+    const existingPlan = await db.execute(sql`
+      SELECT id, content, updated_at FROM nodes
+      WHERE user_id = ${userId}
+      AND node_type = 'daily_plan'
+      AND created_at::date = CURRENT_DATE
+      ORDER BY created_at DESC
+      LIMIT 1
+    `);
+
+    if (existingPlan.rows.length > 0) {
+      try {
+        return JSON.parse(existingPlan.rows[0].content as string);
+      } catch {
+        // If content isn't valid JSON, fall through to regeneration
+      }
+    }
+
+    // 2. No plan for today yet — generate one on-the-fly (fallback)
     const activeTasks = await PlanningRepository.getActiveTasks();
     const recentInsights = await PlanningRepository.getRecentInsights();
+
+    const actionItems = await db.execute(sql`
+      SELECT content FROM nodes
+      WHERE user_id = ${userId} AND node_type = 'action_item'
+      ORDER BY created_at DESC LIMIT 10
+    `);
 
     const contextTasks = activeTasks.rows.map((r: any) => `[Goal: ${r.goal}] Task: ${r.task}`).join('\n');
     const contextInsights = recentInsights.map(i => {
@@ -51,6 +82,7 @@ export class PlanningService {
         return `${parsed.type.toUpperCase()}: ${parsed.title} - ${parsed.body}`;
       } catch { return ''; }
     }).filter(Boolean).join('\n');
+    const actionsText = actionItems.rows.map((r: any) => `- ${r.content}`).join('\n');
 
     const prompt = `
       You are AION, generating a "Daily Focus Schedule" for the user.
@@ -58,11 +90,14 @@ export class PlanningService {
       Current active tasks from goals:
       ${contextTasks || 'No active goal tasks yet.'}
       
+      Pending action items (extracted from thoughts):
+      ${actionsText || 'No pending action items.'}
+      
       Recent AI Insights & Reminders:
       ${contextInsights || 'None.'}
       
       Generate a realistic, text-based daily plan with 3-5 key focus areas or time-blocks.
-      Weave the active tasks and insights into a cohesive day plan.
+      Weave the active tasks, action items, and insights into a cohesive day plan.
       
       Return a JSON object with exactly these fields:
       - greeting: A short, motivating good morning message.
@@ -80,6 +115,22 @@ export class PlanningService {
       aiResponse = aiResponse.substring(startIdx, endIdx + 1);
     }
     
-    return JSON.parse(aiResponse);
+    const parsed = JSON.parse(aiResponse);
+
+    // Persist the generated plan so subsequent loads are instant
+    await db.insert(nodes).values({
+      userId,
+      nodeType: 'daily_plan',
+      content: JSON.stringify(parsed),
+    });
+
+    await db.insert(events).values({
+      userId,
+      eventType: 'plan_generated',
+      payload: { plan: parsed },
+    });
+
+    return parsed;
   }
 }
+

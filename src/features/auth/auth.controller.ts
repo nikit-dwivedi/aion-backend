@@ -13,4 +13,10 @@ export class AuthController {
     const result = await AuthService.login(email, password);
     res.json(result);
   }
+
+  static async getProfile(req: Request, res: Response) {
+    const userId = req.userId!;
+    const result = await AuthService.getProfile(userId);
+    res.json(result);
+  }
 }

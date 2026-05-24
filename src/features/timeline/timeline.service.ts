@@ -6,6 +6,22 @@ export class TimelineService {
     const memories = await TimelineRepository.getRecentMemories(userId, 50);
 
     const enriched = await Promise.all(memories.map(async (mem) => {
+      if (mem.nodeType === 'insight') {
+        const meta = mem.metadata as any;
+        return {
+          ...mem,
+          title: meta?.title || 'Cognitive Insight',
+          recommendation: meta?.recommendation || '',
+          insightType: meta?.type || 'behavioral',
+          strength: meta?.strength || 1.0,
+          relatedEntityOrProject: meta?.relatedEntityOrProject || null,
+          project: null,
+          rawContent: null,
+          sentiment: 'neutral',
+          moodScore: 5
+        };
+      }
+
       const projectName = await TimelineRepository.getProjectForMemory(mem.id);
       const meta = mem.metadata as any;
       return {

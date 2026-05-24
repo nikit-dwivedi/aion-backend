@@ -3,6 +3,7 @@ import { events, nodes, edges } from '../db/schema.js';
 import { sql } from 'drizzle-orm';
 import { llm } from '../services/llm.service.js';
 import { env } from '../config/env.js';
+import { incrementUsage } from '../core/middlewares/quota.middleware.js';
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -63,6 +64,7 @@ async function processPendingEvents() {
         - entities: An array of strings representing key specific entities.
         - people: An array of strings representing people mentioned by name.
         - contradictions: An array of strings representing entities or projects that this new thought actively contradicts or reverses based on the context. Empty array if none.
+        - action_items: An array of strings representing clear tasks or action items derived from the thought. Empty array if none.
         - sentiment: One of "positive", "neutral", "negative", "anxious", "excited", "reflective".
         - mood_score: An integer from 1 to 10 (1=very negative, 5=neutral, 10=very positive).
         - requires_research: A boolean. true if this thought mentions a topic, concept, or question that could benefit from web research to provide more context or answer the user's curiosity. false otherwise.
@@ -94,7 +96,25 @@ async function processPendingEvents() {
       const parsed = JSON.parse(aiResponse);
       const embeddingVector = await llm.embedContent(parsed.summary);
 
+      // Perform Similarity Search to find related past memories
+      const similarNodes = await db.execute(sql`
+        SELECT id, 1 - (embedding <=> ${JSON.stringify(embeddingVector)}::vector) as similarity
+        FROM nodes
+        WHERE node_type = 'memory' AND user_id = ${userId}
+        ORDER BY embedding <=> ${JSON.stringify(embeddingVector)}::vector
+        LIMIT 3
+      `);
+
       await db.transaction(async (tx) => {
+        // 1. Create the Raw Thought Anchor
+        const [rawThoughtNode] = await tx.insert(nodes).values({
+          userId,
+          nodeType: 'raw_thought',
+          content: payload.content || '[Media Thought]',
+          metadata: { originalEventId: eventId, type: payload.type }
+        }).returning();
+
+        // 2. Create the AI Summary Memory Node
         const [memoryNode] = await tx.insert(nodes).values({
           userId,
           nodeType: 'memory',
@@ -102,13 +122,31 @@ async function processPendingEvents() {
           embedding: embeddingVector,
           metadata: { 
             originalEventId: eventId, 
-            rawContent: payload.content,
             sentiment: parsed.sentiment || 'neutral',
             moodScore: parsed.mood_score || 5,
           }
         }).returning();
 
-        if (!memoryNode) throw new Error('Failed to insert memory node');
+        if (!memoryNode || !rawThoughtNode) throw new Error('Failed to insert primary nodes');
+
+        // Link memory to raw thought
+        await tx.insert(edges).values({
+          sourceNodeId: memoryNode.id,
+          targetNodeId: rawThoughtNode.id,
+          relationType: 'summarizes',
+        });
+
+        // 3. Link similar past thoughts
+        for (const simNode of similarNodes.rows) {
+          if ((simNode.similarity as number) > 0.85) {
+            await tx.insert(edges).values({
+              sourceNodeId: rawThoughtNode.id,
+              targetNodeId: simNode.id as string,
+              relationType: 'similar_to',
+              weight: simNode.similarity as number,
+            });
+          }
+        }
 
         const resolveNode = async (nodeType: string, content: string) => {
           const existing = await tx.execute(sql`
@@ -171,6 +209,25 @@ async function processPendingEvents() {
           }
         }
 
+        // Handle extracted action items
+        if (parsed.action_items && Array.isArray(parsed.action_items)) {
+          for (const action of parsed.action_items) {
+            const [actionNode] = await tx.insert(nodes).values({
+              userId,
+              nodeType: 'action_item',
+              content: action,
+            }).returning();
+            
+            if (actionNode) {
+              await tx.insert(edges).values({
+                sourceNodeId: memoryNode.id,
+                targetNodeId: actionNode.id,
+                relationType: 'relates_to',
+              });
+            }
+          }
+        }
+
         await tx.insert(events).values({
           userId,
           eventType: 'memory_processed',
@@ -179,6 +236,7 @@ async function processPendingEvents() {
       });
       
       console.log(`Successfully processed event ${eventId}`);
+      await incrementUsage(userId);
 
       // If research is needed, emit a research_requested event for the agent worker
       if (parsed.requires_research && parsed.research_query) {
@@ -189,6 +247,13 @@ async function processPendingEvents() {
         });
         console.log(`Research requested: "${parsed.research_query}"`);
       }
+
+      // Trigger the planner to re-evaluate today's plan with this new thought
+      await db.insert(events).values({
+        userId,
+        eventType: 'plan_update_requested',
+        payload: { reason: 'new_thought_processed', newInfo: parsed.summary, sourceEventId: eventId }
+      });
 
       await delay(2000);
     } catch (e) {

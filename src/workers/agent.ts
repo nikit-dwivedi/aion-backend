@@ -150,4 +150,13 @@ async function markComplete(eventId: string, userId: string, query: string, summ
     eventType: 'research_completed',
     payload: { sourceResearchId: eventId, query, summary },
   });
+
+  // Trigger the planner to re-evaluate today's plan with research findings
+  if (summary && !summary.startsWith('Research failed')) {
+    await db.insert(events).values({
+      userId,
+      eventType: 'plan_update_requested',
+      payload: { reason: 'research_completed', newInfo: `Research on "${query}": ${summary}`, sourceEventId: eventId }
+    });
+  }
 }
