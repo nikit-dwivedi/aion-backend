@@ -46,6 +46,13 @@ class LLMService {
     }
   }
 
+  get isConfigured(): boolean {
+    if (this.provider === 'gemini') return !!process.env.GEMINI_API_KEY;
+    if (this.provider === 'openai') return !!process.env.OPENAI_API_KEY;
+    if (this.provider === 'ollama') return true;
+    return false;
+  }
+
   // Built-in retry logic for all providers (mostly for Gemini 429s, but safe for all)
   private async callWithRetry<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {

@@ -6,7 +6,7 @@ import { AppError } from '../../core/middlewares/error.middleware.js';
 export class SearchService {
   static async searchMemories(query: string) {
     if (!query) throw new AppError('Missing query', 400);
-    if (!env.GEMINI_API_KEY) throw new AppError('GEMINI_API_KEY is not configured.', 500);
+    if (!llm.isConfigured) throw new AppError('LLM service is not configured.', 500);
 
     const queryEmbedding = await llm.embedContent(query);
     const similarNodes = await SearchRepository.findSimilarMemories(queryEmbedding, 5);

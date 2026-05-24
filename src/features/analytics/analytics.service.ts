@@ -65,7 +65,7 @@ export class AnalyticsService {
   }
 
   static async getForecast(userId: string) {
-    if (!env.GEMINI_API_KEY) return null;
+    if (!llm.isConfigured) return null;
 
     const sentimentTrend = await AnalyticsRepository.getSentimentTrend(userId);
     const captureTrend = await AnalyticsRepository.getCaptureTrend(userId);

@@ -19,8 +19,8 @@ export const startWorker = () => {
 };
 
 async function processPendingEvents() {
-  if (process.env.LLM_PROVIDER === 'gemini' && !env.GEMINI_API_KEY) {
-    console.error('GEMINI_API_KEY is not set but LLM_PROVIDER is gemini. Worker paused.');
+  if (!llm.isConfigured) {
+    console.error('LLM service is not configured. Worker paused.');
     return;
   }
 

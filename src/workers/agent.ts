@@ -20,7 +20,7 @@ export const startAgentWorker = () => {
 };
 
 async function processResearchRequests() {
-  if (!env.GEMINI_API_KEY) return;
+  if (!llm.isConfigured) return;
 
   const pending = await db.execute(sql`
     SELECT e1.* FROM events e1

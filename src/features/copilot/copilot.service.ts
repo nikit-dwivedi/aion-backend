@@ -5,7 +5,7 @@ import { AppError } from '../../core/middlewares/error.middleware.js';
 
 export class CopilotService {
   static async generateInsights(userId: string) {
-    if (!env.GEMINI_API_KEY) throw new AppError('GEMINI_API_KEY not configured.', 500);
+    if (!llm.isConfigured) throw new AppError('LLM service not configured.', 500);
 
     const recentMemories = await CopilotRepository.getRecentMemories(userId, 30);
     if (recentMemories.length < 3) return [];
@@ -55,7 +55,7 @@ Output ONLY raw JSON array.`;
   }
 
   static async getNudge(userId: string) {
-    if (!env.GEMINI_API_KEY) return null;
+    if (!llm.isConfigured) return null;
 
     const recentMemories = await CopilotRepository.getRecentMemories(userId, 5);
     if (recentMemories.length === 0) return null;
@@ -84,7 +84,7 @@ Output ONLY raw JSON without markdown formatting.`;
   }
 
   static async chat(userId: string, message: string, conversationHistory: any[]) {
-    if (!env.GEMINI_API_KEY) throw new AppError('GEMINI_API_KEY not configured.', 500);
+    if (!llm.isConfigured) throw new AppError('LLM service not configured.', 500);
 
     const recentMemories = await CopilotRepository.getRecentMemories(userId, 20);
     const memCtx = recentMemories.map((m, i) => `${i + 1}. ${m.content}`).join('\n');
