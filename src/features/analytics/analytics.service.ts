@@ -1,6 +1,7 @@
 import { AnalyticsRepository } from './analytics.repository.js';
 import { llm } from '../../services/llm.service.js';
 import { env } from '../../config/env.js';
+import { cleanAndParseJson } from '../../core/utils.js';
 
 export class AnalyticsService {
   static async getFocusAnalytics(userId: string) {
@@ -86,10 +87,8 @@ Return JSON with exactly these fields:
 Output ONLY raw JSON.`;
 
     try {
-      let aiResponse = await llm.generateContent({ prompt });
-      const si = aiResponse.indexOf('{'), ei = aiResponse.lastIndexOf('}');
-      if (si !== -1 && ei !== -1) aiResponse = aiResponse.substring(si, ei + 1);
-      return JSON.parse(aiResponse);
+      const aiResponse = await llm.generateContent({ prompt });
+      return cleanAndParseJson(aiResponse);
     } catch {
       return null;
     }

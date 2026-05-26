@@ -6,6 +6,7 @@ import { AppError } from '../../core/middlewares/error.middleware.js';
 import { db } from '../../db/index.js';
 import { users } from '../../db/schema.js';
 import { eq } from 'drizzle-orm';
+import { normalizeTimezone } from '../../core/utils.js';
 
 export class AuthService {
   static async register(email: string, password: string, timezone?: string) {
@@ -15,7 +16,8 @@ export class AuthService {
     if (existingUser) throw new AppError('Email already exists', 400);
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const user = await AuthRepository.createUser(email, passwordHash, timezone);
+    const normalizedTz = normalizeTimezone(timezone);
+    const user = await AuthRepository.createUser(email, passwordHash, normalizedTz);
     
     if (!user) throw new AppError('Failed to create user', 500);
 
@@ -34,8 +36,11 @@ export class AuthService {
     if (!isValid) throw new AppError('Invalid credentials', 401);
 
     // Sync timezone on login if provided
-    if (timezone && user.timezone !== timezone) {
-      await db.update(users).set({ timezone }).where(eq(users.id, user.id));
+    if (timezone) {
+      const normalizedTz = normalizeTimezone(timezone);
+      if (user.timezone !== normalizedTz) {
+        await db.update(users).set({ timezone: normalizedTz }).where(eq(users.id, user.id));
+      }
     }
 
     const token = jwt.sign({ userId: user.id }, env.JWT_SECRET, { expiresIn: '30d' });

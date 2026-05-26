@@ -2,18 +2,32 @@ import { db } from '../db/index.js';
 import { events, nodes, edges, users } from '../db/schema.js';
 import { sql, eq, and, desc } from 'drizzle-orm';
 import { llm } from '../services/llm.service.js';
+import { PgNotifyListener, type NotifyPayload } from '../services/pg_notify_listener.service.js';
+import { cleanAndParseJson, normalizeAllUserTimezones } from '../core/utils.js';
 
+const MAX_RETRIES = 5;
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
  * The Planner Worker has two jobs:
- * 1. Scheduled: Generate a fresh daily_plan at ~6:00 AM in each user's local timezone.
- * 2. Reactive: When a plan_update_requested event fires, re-evaluate and overwrite the plan.
+ * 1. Scheduled: Generate a fresh daily_plan at ~6:00 AM in each user's local timezone. (remains polling — cron-scheduled)
+ * 2. Reactive: When a plan_update_requested event fires, re-evaluate and overwrite the plan. (LISTEN/NOTIFY push)
  */
 export const startPlannerWorker = () => {
-  console.log('Starting Daily Plan Worker...');
+  console.log('[Planner] Starting Daily Plan Worker (hybrid push/scheduled)...');
 
-  // Check for scheduled plan generation every 5 minutes
+  // Trigger timezone normalization check asynchronously on startup
+  normalizeAllUserTimezones().catch(err => {
+    console.error('[Planner] Failed to run timezone normalization:', err);
+  });
+
+  // 1. Reactive: LISTEN/NOTIFY push-based processing for plan updates
+  const listener = new PgNotifyListener('aion_plan_queue', handlePlanNotification);
+  listener.start().catch(err => {
+    console.error('[Planner] Failed to start LISTEN/NOTIFY listener:', err);
+  });
+
+  // 2. Scheduled: Check for morning plan generation every 5 minutes (inherently cron-like)
   setInterval(async () => {
     try {
       await generateScheduledPlans();
@@ -22,15 +36,23 @@ export const startPlannerWorker = () => {
     }
   }, 5 * 60 * 1000);
 
-  // Check for reactive plan update requests every 20 seconds
+  // 3. Fallback sweep for missed plan_update_requested events
   setInterval(async () => {
     try {
-      await processReactivePlanUpdates();
+      await sweepPendingPlanUpdates();
     } catch (error) {
-      console.error('[Planner] Reactive update error:', error);
+      console.error('[Planner] Sweep error:', error);
     }
-  }, 20000);
+  }, 120000); // Every 2 minutes
 };
+
+async function handlePlanNotification(payload: NotifyPayload): Promise<void> {
+  try {
+    await processPlanUpdateById(payload.id);
+  } catch (error) {
+    console.error(`[Planner] Notification handler error for event ${payload.id}:`, error);
+  }
+}
 
 // ─── Scheduled Plan Generation ───────────────────────────────────────────────
 
@@ -67,114 +89,152 @@ async function generateScheduledPlans() {
   }
 }
 
-// ─── Reactive Plan Updates ───────────────────────────────────────────────────
+// ─── Reactive Plan Updates (Push-Driven) ─────────────────────────────────────
 
-async function processReactivePlanUpdates() {
+async function sweepPendingPlanUpdates(): Promise<void> {
   if (!llm.isConfigured) return;
 
   const pending = await db.execute(sql`
-    SELECT e1.* FROM events e1
-    WHERE e1.event_type = 'plan_update_requested'
+    SELECT id FROM events
+    WHERE event_type = 'plan_update_requested'
+    AND processing_status IN ('pending', 'retrying')
+    AND retry_count < ${MAX_RETRIES}
     AND NOT EXISTS (
       SELECT 1 FROM events e2
       WHERE e2.event_type = 'plan_update_processed'
-      AND e2.payload->>'sourcePlanUpdateId' = e1.id::text
+      AND e2.payload->>'sourcePlanUpdateId' = events.id::text
     )
-    LIMIT 1
+    ORDER BY created_at ASC
+    LIMIT 3
   `);
 
   if (pending.rows.length === 0) return;
 
+  console.log(`[Planner] Sweep found ${pending.rows.length} pending plan update(s).`);
   for (const row of pending.rows) {
-    const eventId = row.id as string;
-    const userId = row.user_id as string;
-    const payload = row.payload as any;
+    await processPlanUpdateById(row.id as string);
+  }
+}
 
-    console.log(`[Planner] Reactive update triggered for user ${userId}: "${payload.reason}"`);
+async function processPlanUpdateById(eventId: string): Promise<void> {
+  if (!llm.isConfigured) return;
 
-    try {
-      // 1. Get today's current plan
-      const currentPlan = await getTodaysPlan(userId);
+  const result = await db.execute(sql`
+    SELECT * FROM events
+    WHERE id = ${eventId}
+    AND event_type = 'plan_update_requested'
+    AND processing_status != 'completed'
+    AND processing_status != 'failed'
+    LIMIT 1
+  `);
 
-      if (!currentPlan) {
-        // No plan exists yet, generate one fresh
-        await generatePlanForUser(userId);
+  if (result.rows.length === 0) return;
+
+  const row = result.rows[0] as any;
+  if (!row) return;
+  const userId = row.user_id as string;
+  const payload = row.payload as any;
+
+  // Atomic claim
+  await db.execute(sql`
+    UPDATE events SET processing_status = 'processing'
+    WHERE id = ${eventId} AND processing_status IN ('pending', 'retrying')
+  `);
+
+  console.log(`[Planner] Reactive update triggered for user ${userId}: "${payload.reason}"`);
+
+  try {
+    // 1. Get today's current plan
+    const currentPlan = await getTodaysPlan(userId);
+
+    if (!currentPlan) {
+      // No plan exists yet, generate one fresh
+      await generatePlanForUser(userId);
+    } else {
+      // 2. Ask LLM if the new info changes the plan
+      const newInfo = payload.newInfo || payload.reason || '';
+
+      const prompt = `
+        You are AION's daily planning engine. The user's current daily plan is:
+        ${currentPlan.content}
+        
+        New information has arrived:
+        "${newInfo}"
+        
+        Does this new information require updating the daily plan? If yes, produce a completely revised plan.
+        If no, return the existing plan unchanged.
+        
+        Return a JSON object:
+        {
+          "changed": true/false,
+          "greeting": "A short motivating message",
+          "schedule": ["Array of time-block strings"],
+          "focusHighlight": "The single most important focus for today"
+        }
+        Output ONLY raw JSON. No markdown.
+      `;
+
+      let aiResponse = await llm.generateContent({ prompt });
+      const parsed = cleanAndParseJson(aiResponse);
+
+      if (parsed.changed) {
+        // Overwrite the existing plan node
+        const updatedContent = JSON.stringify({
+          greeting: parsed.greeting,
+          schedule: parsed.schedule,
+          focusHighlight: parsed.focusHighlight,
+        });
+
+        await db.update(nodes)
+          .set({ content: updatedContent, updatedAt: new Date() })
+          .where(eq(nodes.id, currentPlan.id as string));
+
+        console.log(`[Planner] Plan updated for user ${userId}`);
+
+        // Emit notification event for push notification
+        await db.insert(events).values({
+          userId,
+          eventType: 'push_notification_requested',
+          payload: {
+            title: 'Plan Updated',
+            body: `Your daily plan was adjusted: ${parsed.focusHighlight}`,
+            type: 'plan_updated',
+          },
+        });
       } else {
-        // 2. Ask LLM if the new info changes the plan
-        const newInfo = payload.newInfo || payload.reason || '';
-
-        const prompt = `
-          You are AION's daily planning engine. The user's current daily plan is:
-          ${currentPlan.content}
-          
-          New information has arrived:
-          "${newInfo}"
-          
-          Does this new information require updating the daily plan? If yes, produce a completely revised plan.
-          If no, return the existing plan unchanged.
-          
-          Return a JSON object:
-          {
-            "changed": true/false,
-            "greeting": "A short motivating message",
-            "schedule": ["Array of time-block strings"],
-            "focusHighlight": "The single most important focus for today"
-          }
-          Output ONLY raw JSON. No markdown.
-        `;
-
-        let aiResponse = await llm.generateContent({ prompt });
-        const startIdx = aiResponse.indexOf('{');
-        const endIdx = aiResponse.lastIndexOf('}');
-        if (startIdx !== -1 && endIdx !== -1) {
-          aiResponse = aiResponse.substring(startIdx, endIdx + 1);
-        }
-
-        const parsed = JSON.parse(aiResponse);
-
-        if (parsed.changed) {
-          // Overwrite the existing plan node
-          const updatedContent = JSON.stringify({
-            greeting: parsed.greeting,
-            schedule: parsed.schedule,
-            focusHighlight: parsed.focusHighlight,
-          });
-
-          await db.update(nodes)
-            .set({ content: updatedContent, updatedAt: new Date() })
-            .where(eq(nodes.id, currentPlan.id as string));
-
-          console.log(`[Planner] Plan updated for user ${userId}`);
-
-          // Emit notification event for push notification
-          await db.insert(events).values({
-            userId,
-            eventType: 'push_notification_requested',
-            payload: {
-              title: 'Plan Updated',
-              body: `Your daily plan was adjusted: ${parsed.focusHighlight}`,
-              type: 'plan_updated',
-            },
-          });
-        } else {
-          console.log(`[Planner] No plan change needed for user ${userId}`);
-        }
+        console.log(`[Planner] No plan change needed for user ${userId}`);
       }
+    }
 
-      // Mark as processed
-      await db.insert(events).values({
-        userId,
-        eventType: 'plan_update_processed',
-        payload: { sourcePlanUpdateId: eventId },
-      });
-    } catch (e) {
-      console.error(`[Planner] Failed reactive update for event ${eventId}:`, e);
-      // Mark as processed even on failure to avoid infinite loops
-      await db.insert(events).values({
-        userId,
-        eventType: 'plan_update_processed',
-        payload: { sourcePlanUpdateId: eventId, error: true },
-      });
+    // Mark as completed
+    await db.execute(sql`
+      UPDATE events SET processing_status = 'completed'
+      WHERE id = ${eventId}
+    `);
+
+    await db.insert(events).values({
+      userId,
+      eventType: 'plan_update_processed',
+      payload: { sourcePlanUpdateId: eventId },
+    });
+  } catch (e: any) {
+    // DLQ: increment retry count, store error trace
+    const currentRetry = ((row.retry_count as number) || 0) + 1;
+    const newStatus = currentRetry >= MAX_RETRIES ? 'failed' : 'retrying';
+    const errorMessage = e?.message || String(e);
+
+    await db.execute(sql`
+      UPDATE events
+      SET processing_status = ${newStatus},
+          retry_count = ${currentRetry},
+          last_error = ${errorMessage}
+      WHERE id = ${eventId}
+    `);
+
+    if (newStatus === 'failed') {
+      console.error(`[Planner] Event ${eventId} moved to DLQ after ${MAX_RETRIES} failures. Last error: ${errorMessage}`);
+    } else {
+      console.warn(`[Planner] Event ${eventId} failed (attempt ${currentRetry}/${MAX_RETRIES}): ${errorMessage}`);
     }
   }
 }
@@ -255,13 +315,7 @@ async function generatePlanForUser(userId: string) {
   `;
 
   let aiResponse = await llm.generateContent({ prompt });
-  const startIdx = aiResponse.indexOf('{');
-  const endIdx = aiResponse.lastIndexOf('}');
-  if (startIdx !== -1 && endIdx !== -1) {
-    aiResponse = aiResponse.substring(startIdx, endIdx + 1);
-  }
-
-  const parsed = JSON.parse(aiResponse);
+  const parsed = cleanAndParseJson(aiResponse);
   const planContent = JSON.stringify(parsed);
 
   // Upsert: if a plan already exists for today, overwrite it

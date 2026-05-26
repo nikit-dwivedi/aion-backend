@@ -1,120 +1,220 @@
 import { db } from '../db/index.js';
 import { events, nodes, edges } from '../db/schema.js';
-import { sql } from 'drizzle-orm';
+import { sql, eq } from 'drizzle-orm';
 import { llm } from '../services/llm.service.js';
 import { env } from '../config/env.js';
 import { incrementUsage } from '../core/middlewares/quota.middleware.js';
+import { PgNotifyListener, type NotifyPayload } from '../services/pg_notify_listener.service.js';
+import { cleanAndParseJson } from '../core/utils.js';
 
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const MAX_RETRIES = 5;
 
+/**
+ * Start the LLM Extractor Worker.
+ * 
+ * Uses PostgreSQL LISTEN/NOTIFY for instant event processing.
+ * Falls back to a 60-second sweep for any events missed during reconnection windows.
+ */
 export const startWorker = () => {
-  console.log('Starting AI Processing Worker...');
-  
+  console.log('[Extractor] Starting AI Processing Worker (push-driven)...');
+
+  // 1. Primary: LISTEN/NOTIFY push-based processing
+  const listener = new PgNotifyListener('aion_memory_queue', handleNotification);
+  listener.start().catch(err => {
+    console.error('[Extractor] Failed to start LISTEN/NOTIFY listener:', err);
+  });
+
+  // 2. Fallback: Periodic sweep for missed events (reconnection gaps, DLQ retries)
   setInterval(async () => {
     try {
-      await processPendingEvents();
+      await sweepPendingEvents();
     } catch (error) {
-      console.error('Worker error:', error);
+      console.error('[Extractor] Sweep error:', error);
     }
-  }, 15000);
+  }, 60000); // Every 60 seconds (reduced from 15s since push handles the hot path)
 };
 
-async function processPendingEvents() {
-  if (!llm.isConfigured) {
-    console.error('LLM service is not configured. Worker paused.');
-    return;
+/**
+ * Handle a NOTIFY push event: look up the full event and process it.
+ */
+async function handleNotification(payload: NotifyPayload): Promise<void> {
+  try {
+    await processEventById(payload.id);
+  } catch (error) {
+    console.error(`[Extractor] Notification handler error for event ${payload.id}:`, error);
   }
+}
+
+/**
+ * Fallback sweep: finds pending events that weren't processed via NOTIFY
+ * (e.g., during listener reconnection, server restart, or retryable failures).
+ */
+async function sweepPendingEvents(): Promise<void> {
+  if (!llm.isConfigured) return;
 
   const pendingEvents = await db.execute(sql`
-    SELECT e1.* FROM events e1 
-    WHERE e1.event_type = 'memory_created' 
+    SELECT id FROM events
+    WHERE event_type = 'memory_created'
+    AND processing_status IN ('pending', 'retrying')
+    AND retry_count < ${MAX_RETRIES}
     AND NOT EXISTS (
-      SELECT 1 FROM events e2 
-      WHERE e2.event_type = 'memory_processed' 
-      AND e2.payload->>'originalEventId' = e1.id::text
+      SELECT 1 FROM events e2
+      WHERE e2.event_type = 'memory_processed'
+      AND e2.payload->>'originalEventId' = events.id::text
     )
-    LIMIT 3
+    ORDER BY created_at ASC
+    LIMIT 5
   `);
 
   if (pendingEvents.rows.length === 0) return;
 
+  console.log(`[Extractor] Sweep found ${pendingEvents.rows.length} pending event(s).`);
   for (const row of pendingEvents.rows) {
-    const eventId = row.id as string;
-    const userId = row.user_id as string;
-    const payload = row.payload as any;
+    await processEventById(row.id as string);
+  }
+}
+
+/**
+ * Core processing logic with DLQ fault isolation.
+ * 
+ * On failure:
+ *   - Increments retry_count
+ *   - Stores the error trace in last_error
+ *   - After MAX_RETRIES, marks as 'failed' (DLQ) to prevent infinite loops
+ */
+async function processEventById(eventId: string): Promise<void> {
+  if (!llm.isConfigured) {
+    console.error('[Extractor] LLM service is not configured. Skipping.');
+    return;
+  }
+
+  // Fetch the full event
+  const result = await db.execute(sql`
+    SELECT * FROM events
+    WHERE id = ${eventId}
+    AND event_type = 'memory_created'
+    AND processing_status != 'completed'
+    AND processing_status != 'failed'
+    LIMIT 1
+  `);
+
+  if (result.rows.length === 0) return;
+
+  const row = result.rows[0] as any;
+  if (!row) return;
+  const userId = row.user_id as string;
+  const payload = row.payload as any;
+
+  // Mark as processing (atomic claim)
+  await db.execute(sql`
+    UPDATE events SET processing_status = 'processing'
+    WHERE id = ${eventId} AND processing_status IN ('pending', 'retrying')
+  `);
+
+  console.log(`[Extractor] Processing event ${eventId}...`);
+
+  try {
+    const recentMems = await db.execute(sql`
+      SELECT content FROM nodes 
+      WHERE node_type = 'memory' AND user_id = ${userId}
+      ORDER BY created_at DESC LIMIT 10
+    `);
+    const recentText = recentMems.rows.map((r: any, i: number) => `${i + 1}. ${r.content}`).join('\n');
+
+    const promptInstruction = `
+      You are AION, extracting structured metadata from a new thought.
+      Here are the user's recent thoughts for context:
+      ${recentText || 'None'}
+
+      Return a JSON object with exactly these fields:
+      - summary: A concise summary of the thought.
+      - project: A single string representing the broader project or category this thought belongs to (e.g., "Learning", "Work", "Personal"). Keep it short and high-level.
+      - subproject: A single string representing the subproject or specific topic within the project (e.g., "Flutter", "Tax Filing", "Cooking"). If no subproject applies, set to null.
+      - entities: An array of strings representing key specific entities.
+      - people: An array of strings representing people mentioned by name.
+      - contradictions: An array of strings representing entities or projects that this new thought actively contradicts or reverses based on the context. Empty array if none.
+      - action_items: An array of strings representing clear tasks or action items derived from the thought. Empty array if none.
+      - sentiment: One of "positive", "neutral", "negative", "anxious", "excited", "reflective".
+      - mood_score: An integer from 1 to 10 (1=very negative, 5=neutral, 10=very positive).
+      - requires_research: A boolean. true if this thought mentions a topic, concept, or question that could benefit from web research to provide more context or answer the user's curiosity. false otherwise.
+      - research_query: If requires_research is true, a short web search query string (max 10 words) to find relevant information. null if false.
+      Output ONLY raw JSON without markdown formatting.
+    `;
+
+    let aiResponse: string;
+
+    if ((payload.type === 'audio' || payload.type === 'image') && payload.mediaBase64) {
+      aiResponse = await llm.generateContent({
+        systemInstruction: payload.type === 'audio' ? 'Listen to this audio thought.' : 'Analyze this image thought.',
+        prompt: promptInstruction,
+        mediaBuffer: payload.mediaBase64,
+        mimeType: payload.mimeType,
+      });
+    } else {
+      aiResponse = await llm.generateContent({
+        prompt: `Analyze this thought: "${payload.content}"\n${promptInstruction}`
+      });
+    }
     
-    console.log(`Processing event ${eventId}...`);
-    
-    try {
-      const recentMems = await db.execute(sql`
-        SELECT content FROM nodes 
-        WHERE node_type = 'memory' AND user_id = ${userId}
-        ORDER BY created_at DESC LIMIT 10
-      `);
-      const recentText = recentMems.rows.map((r, i) => `${i + 1}. ${r.content}`).join('\n');
+    const parsed = cleanAndParseJson(aiResponse);
+    let finalSummary = parsed.summary;
+    let embeddingVector = await llm.embedContent(finalSummary);
 
-      const promptInstruction = `
-        You are AION, extracting structured metadata from a new thought.
-        Here are the user's recent thoughts for context:
-        ${recentText || 'None'}
+    // Perform Similarity Search to find related past memories
+    const similarNodes = await db.execute(sql`
+      SELECT id, content, 1 - (embedding <=> ${JSON.stringify(embeddingVector)}::vector) as similarity
+      FROM nodes
+      WHERE node_type = 'memory' AND user_id = ${userId}
+      ORDER BY embedding <=> ${JSON.stringify(embeddingVector)}::vector
+      LIMIT 3
+    `);
 
-        Return a JSON object with exactly these fields:
-        - summary: A concise summary of the thought.
-        - project: A single string representing the broader project or category this thought belongs to. Keep it short.
-        - entities: An array of strings representing key specific entities.
-        - people: An array of strings representing people mentioned by name.
-        - contradictions: An array of strings representing entities or projects that this new thought actively contradicts or reverses based on the context. Empty array if none.
-        - action_items: An array of strings representing clear tasks or action items derived from the thought. Empty array if none.
-        - sentiment: One of "positive", "neutral", "negative", "anxious", "excited", "reflective".
-        - mood_score: An integer from 1 to 10 (1=very negative, 5=neutral, 10=very positive).
-        - requires_research: A boolean. true if this thought mentions a topic, concept, or question that could benefit from web research to provide more context or answer the user's curiosity. false otherwise.
-        - research_query: If requires_research is true, a short web search query string (max 10 words) to find relevant information. null if false.
-        Output ONLY raw JSON without markdown formatting.
-      `;
+    await db.transaction(async (tx) => {
+      // 1. Create the Raw Thought Anchor
+      const [rawThoughtNode] = await tx.insert(nodes).values({
+        userId,
+        nodeType: 'raw_thought',
+        content: payload.content || '[Media Thought]',
+        metadata: { originalEventId: eventId, type: payload.type }
+      }).returning();
 
-      let aiResponse: string;
+      if (!rawThoughtNode) throw new Error('Failed to insert raw thought node');
 
-      if ((payload.type === 'audio' || payload.type === 'image') && payload.mediaBase64) {
-        aiResponse = await llm.generateContent({
-          systemInstruction: payload.type === 'audio' ? 'Listen to this audio thought.' : 'Analyze this image thought.',
-          prompt: promptInstruction,
-          mediaBuffer: payload.mediaBase64,
-          mimeType: payload.mimeType,
-        });
+      // Check for similarity merging (> 0.80)
+      let memoryNodeId: string;
+      const topMatch = similarNodes.rows[0] as any;
+      if (topMatch && (topMatch.similarity as number) > 0.80) {
+        memoryNodeId = topMatch.id as string;
+        console.log(`[Extractor] High similarity match found (${(topMatch.similarity as number).toFixed(2)} > 0.80). Merging with memory node ${memoryNodeId}...`);
+
+        const mergePrompt = `
+          You are AION, a cognitive operating system. Your task is to merge a new thought summary into an existing memory node's content to keep the memory graph consolidated, clean, and evolving without creating duplicate nodes.
+
+          Existing Memory Content:
+          "${topMatch.content}"
+
+          New Thought Summary:
+          "${parsed.summary}"
+
+          Please return an enriched, consolidated, and comprehensive single summary that captures both the existing memory and the new details naturally, without repeating information. Keep it cohesive and clear.
+          Output ONLY the final merged content text. No conversational filler, no tags, no JSON, no markdown codeblocks. Just the plain text.
+        `;
+
+        const mergedContent = (await llm.generateContent({ prompt: mergePrompt })).trim();
+        finalSummary = mergedContent;
+        // Generate new embedding for the merged content
+        embeddingVector = await llm.embedContent(mergedContent);
+
+        // Update existing memory node
+        await tx.execute(sql`
+          UPDATE nodes
+          SET content = ${mergedContent},
+              embedding = ${JSON.stringify(embeddingVector)}::vector,
+              updated_at = NOW()
+          WHERE id = ${memoryNodeId}
+        `);
       } else {
-        aiResponse = await llm.generateContent({
-          prompt: `Analyze this thought: "${payload.content}"\n${promptInstruction}`
-        });
-      }
-      
-      const startIdx = aiResponse.indexOf('{');
-      const endIdx = aiResponse.lastIndexOf('}');
-      if (startIdx !== -1 && endIdx !== -1) {
-        aiResponse = aiResponse.substring(startIdx, endIdx + 1);
-      }
-      
-      const parsed = JSON.parse(aiResponse);
-      const embeddingVector = await llm.embedContent(parsed.summary);
-
-      // Perform Similarity Search to find related past memories
-      const similarNodes = await db.execute(sql`
-        SELECT id, 1 - (embedding <=> ${JSON.stringify(embeddingVector)}::vector) as similarity
-        FROM nodes
-        WHERE node_type = 'memory' AND user_id = ${userId}
-        ORDER BY embedding <=> ${JSON.stringify(embeddingVector)}::vector
-        LIMIT 3
-      `);
-
-      await db.transaction(async (tx) => {
-        // 1. Create the Raw Thought Anchor
-        const [rawThoughtNode] = await tx.insert(nodes).values({
-          userId,
-          nodeType: 'raw_thought',
-          content: payload.content || '[Media Thought]',
-          metadata: { originalEventId: eventId, type: payload.type }
-        }).returning();
-
-        // 2. Create the AI Summary Memory Node
+        // Create new memory node
         const [memoryNode] = await tx.insert(nodes).values({
           userId,
           nodeType: 'memory',
@@ -127,137 +227,185 @@ async function processPendingEvents() {
           }
         }).returning();
 
-        if (!memoryNode || !rawThoughtNode) throw new Error('Failed to insert primary nodes');
-
-        // Link memory to raw thought
-        await tx.insert(edges).values({
-          sourceNodeId: memoryNode.id,
-          targetNodeId: rawThoughtNode.id,
-          relationType: 'summarizes',
-        });
-
-        // 3. Link similar past thoughts
-        for (const simNode of similarNodes.rows) {
-          if ((simNode.similarity as number) > 0.85) {
-            await tx.insert(edges).values({
-              sourceNodeId: rawThoughtNode.id,
-              targetNodeId: simNode.id as string,
-              relationType: 'similar_to',
-              weight: simNode.similarity as number,
-            });
-          }
-        }
-
-        const resolveNode = async (nodeType: string, content: string) => {
-          const existing = await tx.execute(sql`
-            SELECT id FROM nodes 
-            WHERE node_type = ${nodeType} AND lower(content) = lower(${content})
-            LIMIT 1
-          `);
-          
-          if (existing?.rows?.length > 0) return existing?.rows?.[0]?.id as string;
-          
-          const [newNode] = await tx.insert(nodes).values({
-            userId,
-            nodeType,
-            content
-          }).returning();
-          
-          if (!newNode) throw new Error('Failed to insert node');
-          return newNode.id;
-        };
-
-        if (parsed.project) {
-          const projectId = await resolveNode('project', parsed.project);
-          await tx.insert(edges).values({
-            sourceNodeId: memoryNode.id,
-            targetNodeId: projectId,
-            relationType: 'belongs_to',
-          });
-        }
-
-        if (parsed.entities && Array.isArray(parsed.entities)) {
-          for (const entity of parsed.entities) {
-            const entityId = await resolveNode('entity', entity);
-            await tx.insert(edges).values({
-              sourceNodeId: memoryNode.id,
-              targetNodeId: entityId,
-              relationType: 'mentions',
-            });
-          }
-        }
-
-        if (parsed.people && Array.isArray(parsed.people)) {
-          for (const person of parsed.people) {
-            const personId = await resolveNode('person', person);
-            await tx.insert(edges).values({
-              sourceNodeId: memoryNode.id,
-              targetNodeId: personId,
-              relationType: 'mentions_person',
-            });
-          }
-        }
-
-        if (parsed.contradictions && Array.isArray(parsed.contradictions)) {
-          for (const contradiction of parsed.contradictions) {
-            const cId = await resolveNode('entity', contradiction);
-            await tx.insert(edges).values({
-              sourceNodeId: memoryNode.id,
-              targetNodeId: cId,
-              relationType: 'contradicts',
-            });
-          }
-        }
-
-        // Handle extracted action items
-        if (parsed.action_items && Array.isArray(parsed.action_items)) {
-          for (const action of parsed.action_items) {
-            const [actionNode] = await tx.insert(nodes).values({
-              userId,
-              nodeType: 'action_item',
-              content: action,
-            }).returning();
-            
-            if (actionNode) {
-              await tx.insert(edges).values({
-                sourceNodeId: memoryNode.id,
-                targetNodeId: actionNode.id,
-                relationType: 'relates_to',
-              });
-            }
-          }
-        }
-
-        await tx.insert(events).values({
-          userId,
-          eventType: 'memory_processed',
-          payload: { originalEventId: eventId, summary: parsed.summary }
-        });
-      });
-      
-      console.log(`Successfully processed event ${eventId}`);
-      await incrementUsage(userId);
-
-      // If research is needed, emit a research_requested event for the agent worker
-      if (parsed.requires_research && parsed.research_query) {
-        await db.insert(events).values({
-          userId,
-          eventType: 'research_requested',
-          payload: { query: parsed.research_query, sourceEventId: eventId, sourceSummary: parsed.summary }
-        });
-        console.log(`Research requested: "${parsed.research_query}"`);
+        if (!memoryNode) throw new Error('Failed to insert primary memory node');
+        memoryNodeId = memoryNode.id;
       }
 
-      // Trigger the planner to re-evaluate today's plan with this new thought
-      await db.insert(events).values({
-        userId,
-        eventType: 'plan_update_requested',
-        payload: { reason: 'new_thought_processed', newInfo: parsed.summary, sourceEventId: eventId }
+      // Link memory to raw thought
+      await tx.insert(edges).values({
+        sourceNodeId: memoryNodeId,
+        targetNodeId: rawThoughtNode.id,
+        relationType: 'summarizes',
       });
 
-      await delay(2000);
-    } catch (e) {
-      console.error(`Failed to process event ${eventId}:`, e);
+      // 3. Link similar past thoughts (excluding the merged node if we merged)
+      for (const simNode of similarNodes.rows) {
+        if ((simNode.similarity as number) > 0.85 && simNode.id !== memoryNodeId) {
+          await tx.insert(edges).values({
+            sourceNodeId: rawThoughtNode.id,
+            targetNodeId: simNode.id as string,
+            relationType: 'similar_to',
+            weight: simNode.similarity as number,
+          });
+        }
+      }
+
+      const resolveNode = async (nodeType: string, content: string) => {
+        const existing = await tx.execute(sql`
+          SELECT id FROM nodes 
+          WHERE node_type = ${nodeType} AND lower(content) = lower(${content}) AND user_id = ${userId}
+          LIMIT 1
+        `);
+        
+        if (existing?.rows?.length > 0) return existing?.rows?.[0]?.id as string;
+        
+        const [newNode] = await tx.insert(nodes).values({
+          userId,
+          nodeType,
+          content
+        }).returning();
+        
+        if (!newNode) throw new Error('Failed to insert node');
+        return newNode.id;
+      };
+
+      // Project/Subproject Resolution
+      if (parsed.project) {
+        const projectId = await resolveNode('project', parsed.project);
+        let activeProjectId = projectId;
+
+        if (parsed.subproject) {
+          const subprojectId = await resolveNode('project', parsed.subproject);
+          activeProjectId = subprojectId;
+
+          // Link subproject to parent project
+          const existingEdge = await tx.execute(sql`
+            SELECT id FROM edges
+            WHERE source_node_id = ${subprojectId}
+            AND target_node_id = ${projectId}
+            AND relation_type = 'subproject_of'
+            LIMIT 1
+          `);
+          if (existingEdge.rows.length === 0) {
+            await tx.insert(edges).values({
+              sourceNodeId: subprojectId,
+              targetNodeId: projectId,
+              relationType: 'subproject_of',
+            });
+          }
+        }
+
+        // Link memory to active project
+        await tx.insert(edges).values({
+          sourceNodeId: memoryNodeId,
+          targetNodeId: activeProjectId,
+          relationType: 'belongs_to',
+        });
+      }
+
+      if (parsed.entities && Array.isArray(parsed.entities)) {
+        for (const entity of parsed.entities) {
+          const entityId = await resolveNode('entity', entity);
+          await tx.insert(edges).values({
+            sourceNodeId: memoryNodeId,
+            targetNodeId: entityId,
+            relationType: 'mentions',
+          });
+        }
+      }
+
+      if (parsed.people && Array.isArray(parsed.people)) {
+        for (const person of parsed.people) {
+          const personId = await resolveNode('person', person);
+          await tx.insert(edges).values({
+            sourceNodeId: memoryNodeId,
+            targetNodeId: personId,
+            relationType: 'mentions_person',
+          });
+        }
+      }
+
+      if (parsed.contradictions && Array.isArray(parsed.contradictions)) {
+        for (const contradiction of parsed.contradictions) {
+          const cId = await resolveNode('entity', contradiction);
+          await tx.insert(edges).values({
+            sourceNodeId: memoryNodeId,
+            targetNodeId: cId,
+            relationType: 'contradicts',
+          });
+        }
+      }
+
+      // Handle extracted action items
+      if (parsed.action_items && Array.isArray(parsed.action_items)) {
+        for (const action of parsed.action_items) {
+          const [actionNode] = await tx.insert(nodes).values({
+            userId,
+            nodeType: 'action_item',
+            content: action,
+          }).returning();
+          
+          if (actionNode) {
+            await tx.insert(edges).values({
+              sourceNodeId: memoryNodeId,
+              targetNodeId: actionNode.id,
+              relationType: 'relates_to',
+            });
+          }
+        }
+      }
+
+      // Mark the event as completed within the transaction
+      await tx.execute(sql`
+        UPDATE events SET processing_status = 'completed'
+        WHERE id = ${eventId}
+      `);
+
+      await tx.insert(events).values({
+        userId,
+        eventType: 'memory_processed',
+        payload: { originalEventId: eventId, summary: finalSummary }
+      });
+    });
+    
+    console.log(`[Extractor] Successfully processed event ${eventId}`);
+    await incrementUsage(userId);
+
+    // If research is needed, emit a research_requested event for the agent worker
+    if (parsed.requires_research && parsed.research_query) {
+      await db.insert(events).values({
+        userId,
+        eventType: 'research_requested',
+        payload: { query: parsed.research_query, sourceEventId: eventId, sourceSummary: parsed.summary }
+      });
+      console.log(`[Extractor] Research requested: "${parsed.research_query}"`);
+    }
+
+    // Trigger the planner to re-evaluate today's plan with this new thought
+    await db.insert(events).values({
+      userId,
+      eventType: 'plan_update_requested',
+      payload: { reason: 'new_thought_processed', newInfo: parsed.summary, sourceEventId: eventId }
+    });
+
+  } catch (e: any) {
+    // DLQ: increment retry count, store error trace
+    const currentRetry = ((row.retry_count as number) || 0) + 1;
+    const newStatus = currentRetry >= MAX_RETRIES ? 'failed' : 'retrying';
+    const errorMessage = e?.message || String(e);
+
+    await db.execute(sql`
+      UPDATE events
+      SET processing_status = ${newStatus},
+          retry_count = ${currentRetry},
+          last_error = ${errorMessage}
+      WHERE id = ${eventId}
+    `);
+
+    if (newStatus === 'failed') {
+      console.error(`[Extractor] Event ${eventId} moved to DLQ after ${MAX_RETRIES} failures. Last error: ${errorMessage}`);
+    } else {
+      console.warn(`[Extractor] Event ${eventId} failed (attempt ${currentRetry}/${MAX_RETRIES}): ${errorMessage}`);
     }
   }
 }

@@ -4,6 +4,7 @@ import { AppError } from '../../core/middlewares/error.middleware.js';
 import { db } from '../../db/index.js';
 import { nodes, events } from '../../db/schema.js';
 import { sql } from 'drizzle-orm';
+import { cleanAndParseJson } from '../../core/utils.js';
 
 export class PlanningService {
   static async generateBreakdown(userId: string, goal: string) {
@@ -28,15 +29,8 @@ export class PlanningService {
       Output ONLY raw JSON. No markdown.
     `;
 
-    let aiResponse = await llm.generateContent({ prompt });
-    
-    const startIdx = aiResponse.indexOf('{');
-    const endIdx = aiResponse.lastIndexOf('}');
-    if (startIdx !== -1 && endIdx !== -1) {
-      aiResponse = aiResponse.substring(startIdx, endIdx + 1);
-    }
-    
-    const breakdown = JSON.parse(aiResponse);
+    const aiResponse = await llm.generateContent({ prompt });
+    const breakdown = cleanAndParseJson(aiResponse);
 
     await PlanningRepository.saveGoalBreakdown(userId, breakdown);
 
@@ -59,7 +53,10 @@ export class PlanningService {
 
     if (existingPlan.rows.length > 0) {
       try {
-        return JSON.parse(existingPlan.rows[0].content as string);
+        const firstRow = existingPlan.rows[0] as any;
+        if (firstRow && firstRow.content) {
+          return JSON.parse(firstRow.content as string);
+        }
       } catch {
         // If content isn't valid JSON, fall through to regeneration
       }
@@ -107,15 +104,8 @@ export class PlanningService {
       Output ONLY raw JSON. No markdown.
     `;
 
-    let aiResponse = await llm.generateContent({ prompt });
-    
-    const startIdx = aiResponse.indexOf('{');
-    const endIdx = aiResponse.lastIndexOf('}');
-    if (startIdx !== -1 && endIdx !== -1) {
-      aiResponse = aiResponse.substring(startIdx, endIdx + 1);
-    }
-    
-    const parsed = JSON.parse(aiResponse);
+    const aiResponse = await llm.generateContent({ prompt });
+    const parsed = cleanAndParseJson(aiResponse);
 
     // Persist the generated plan so subsequent loads are instant
     await db.insert(nodes).values({

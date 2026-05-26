@@ -2,6 +2,7 @@ import { CopilotRepository } from './copilot.repository.js';
 import { llm } from '../../services/llm.service.js';
 import { env } from '../../config/env.js';
 import { AppError } from '../../core/middlewares/error.middleware.js';
+import { cleanAndParseJson } from '../../core/utils.js';
 
 export class CopilotService {
   static async generateInsights(userId: string) {
@@ -26,10 +27,18 @@ Return JSON array with: type, title (max 10 words), body (1-2 sentences), urgenc
 Output ONLY raw JSON array.`;
 
     let aiResponse = await llm.generateContent({ prompt });
+    // This endpoint returns a JSON array, so extract array brackets
     const si = aiResponse.indexOf('['), ei = aiResponse.lastIndexOf(']');
     if (si !== -1 && ei !== -1) aiResponse = aiResponse.substring(si, ei + 1);
     
-    const insights = JSON.parse(aiResponse);
+    let insights: any[];
+    try {
+      insights = JSON.parse(aiResponse);
+    } catch {
+      // If array parse fails, try wrapping in array after object parse
+      const obj = cleanAndParseJson(aiResponse);
+      insights = Array.isArray(obj) ? obj : [obj];
+    }
 
     const enriched = insights.map((ins: any) => {
       const sourceMemories = (ins.sources || []).map((idx: number) => {
@@ -74,10 +83,8 @@ Return a JSON object with exactly two fields:
 Output ONLY raw JSON without markdown formatting.`;
 
     try {
-      let aiResponse = await llm.generateContent({ prompt });
-      const si = aiResponse.indexOf('{'), ei = aiResponse.lastIndexOf('}');
-      if (si !== -1 && ei !== -1) aiResponse = aiResponse.substring(si, ei + 1);
-      return JSON.parse(aiResponse);
+      const aiResponse = await llm.generateContent({ prompt });
+      return cleanAndParseJson(aiResponse);
     } catch {
       return null;
     }

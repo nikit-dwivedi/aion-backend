@@ -3,15 +3,21 @@ import { nodes, edges, events } from '../db/schema.js';
 import { sql, eq, and } from 'drizzle-orm';
 import { llm } from '../services/llm.service.js';
 import { AnalyticsRepository } from '../features/analytics/analytics.repository.js';
+import { cleanAndParseJson } from '../core/utils.js';
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+const DECAY_FACTOR = 0.95;       // Weekly weight decay multiplier
+const PRUNE_THRESHOLD = 0.2;     // Remove edges below this weight
+const MAX_DEGREE = 50;           // Maximum edges per node (supernode cap)
+
 /**
- * The Insight Engine runs periodically to detect behavioral, emotional, and productivity patterns
- * in the user's mind graph. It stores these as 'insight' nodes and links them back to their source graph elements.
+ * The Insight Engine runs periodically to:
+ *   1. Detect behavioral, emotional, and productivity patterns in the user's mind graph
+ *   2. Run graph compaction (edge decay + pruning + supernode gating)
  */
 export const startInsightWorker = () => {
-  console.log('Starting Insight Engine Worker...');
+  console.log('[InsightWorker] Starting Insight Engine Worker...');
 
   // Check every hour for users needing pattern analysis
   setInterval(async () => {
@@ -21,6 +27,15 @@ export const startInsightWorker = () => {
       console.error('[InsightWorker] Error running engine:', error);
     }
   }, 60 * 60 * 1000);
+
+  // Run graph compaction every 6 hours
+  setInterval(async () => {
+    try {
+      await runGraphCompaction();
+    } catch (error) {
+      console.error('[InsightWorker] Graph compaction error:', error);
+    }
+  }, 6 * 60 * 60 * 1000);
 
   // Proactive run on worker boot after a small delay (15 seconds) to avoid boot congestion
   setTimeout(async () => {
@@ -32,6 +47,60 @@ export const startInsightWorker = () => {
     }
   }, 15000);
 };
+
+// ─── Graph Compaction (Entropic Decay) ───────────────────────────────────────
+
+/**
+ * Graph Compaction performs three operations:
+ *   1. Edge Weight Decay: Multiply all edge weights by DECAY_FACTOR (0.95)
+ *   2. Threshold Pruning: Delete edges whose weight has fallen below PRUNE_THRESHOLD (0.2)
+ *   3. Supernode Gating: For nodes with > MAX_DEGREE edges, remove the weakest edges
+ * 
+ * All operations run inside a single transaction for atomicity.
+ */
+async function runGraphCompaction() {
+  console.log('[InsightWorker] Running graph compaction...');
+
+  try {
+    await db.transaction(async (tx) => {
+      // 1. Edge Weight Decay: W = W × 0.95
+      const decayResult = await tx.execute(sql`
+        UPDATE edges
+        SET weight = weight * ${DECAY_FACTOR}
+        WHERE weight > ${PRUNE_THRESHOLD}
+      `);
+      console.log(`[InsightWorker] Decay applied to edges.`);
+
+      // 2. Threshold Pruning: delete edges with weight < 0.2
+      const pruneResult = await tx.execute(sql`
+        DELETE FROM edges
+        WHERE weight < ${PRUNE_THRESHOLD}
+          AND relation_type NOT IN ('summarizes', 'belongs_to')
+      `);
+      console.log(`[InsightWorker] Pruned low-weight edges.`);
+
+      // 3. Supernode Gating: remove excess edges from nodes with too many connections
+      // Keep only the top MAX_DEGREE edges (by weight) per source node
+      const supernodeResult = await tx.execute(sql`
+        DELETE FROM edges
+        WHERE id IN (
+          SELECT id FROM (
+            SELECT
+              e.id,
+              ROW_NUMBER() OVER (PARTITION BY e.source_node_id ORDER BY e.weight DESC) as rn
+            FROM edges e
+          ) ranked
+          WHERE ranked.rn > ${MAX_DEGREE}
+        )
+      `);
+      console.log(`[InsightWorker] Supernode gating completed.`);
+    });
+
+    console.log('[InsightWorker] Graph compaction finished successfully.');
+  } catch (error) {
+    console.error('[InsightWorker] Graph compaction failed:', error);
+  }
+}
 
 async function runInsightEngine() {
   if (!llm.isConfigured) {
@@ -149,13 +218,7 @@ async function generateInsightsForUser(userId: string) {
   `;
 
   let aiResponse = await llm.generateContent({ prompt });
-  const startIdx = aiResponse.indexOf('{');
-  const endIdx = aiResponse.lastIndexOf('}');
-  if (startIdx !== -1 && endIdx !== -1) {
-    aiResponse = aiResponse.substring(startIdx, endIdx + 1);
-  }
-
-  const parsed = JSON.parse(aiResponse);
+  const parsed = cleanAndParseJson(aiResponse);
   if (!parsed.insights || !Array.isArray(parsed.insights)) {
     throw new Error('Invalid response structure from LLM');
   }

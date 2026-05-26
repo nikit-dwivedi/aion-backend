@@ -3,6 +3,7 @@ import { nodes, events, edges } from '../../db/schema.js';
 import { sql, eq, and } from 'drizzle-orm';
 import { llm } from '../../services/llm.service.js';
 import { incrementUsage } from '../../core/middlewares/quota.middleware.js';
+import { cleanAndParseJson } from '../../core/utils.js';
 
 export class DeepDiveService {
   async getThoughtHistory(userId: string, rawThoughtId: string) {
@@ -108,9 +109,7 @@ export class DeepDiveService {
     `;
 
     const aiResponseRaw = await llm.generateContent({ prompt });
-    const startIdx = aiResponseRaw.indexOf('{');
-    const endIdx = aiResponseRaw.lastIndexOf('}');
-    const parsed = JSON.parse(aiResponseRaw.substring(startIdx, endIdx + 1));
+    const parsed = cleanAndParseJson(aiResponseRaw);
 
     // 5. Save everything in a transaction
     await db.transaction(async (tx) => {

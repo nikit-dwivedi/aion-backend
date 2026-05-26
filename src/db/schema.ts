@@ -18,6 +18,9 @@ export const events = pgTable('events', {
   clientId: text('client_id'), // Optional: Client-generated ID for offline sync idempotency
   eventType: text('event_type').notNull(), // e.g., 'memory_created', 'memory_processed', 'deep_dive_chat', 'thought_updated', 'plan_generated'
   payload: jsonb('payload').notNull(),
+  processingStatus: text('processing_status').default('pending').notNull(), // 'pending' | 'processing' | 'completed' | 'failed' | 'retrying'
+  retryCount: integer('retry_count').default(0).notNull(),
+  lastError: text('last_error'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
