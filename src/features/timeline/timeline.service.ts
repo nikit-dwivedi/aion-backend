@@ -7,14 +7,42 @@ export class TimelineService {
 
     const enriched = await Promise.all(memories.map(async (mem) => {
       if (mem.nodeType === 'insight') {
-        const meta = mem.metadata as any;
+        let content = mem.content;
+        let title = 'Cognitive Insight';
+        let recommendation = '';
+        let insightType = 'behavioral';
+        let strength = 1.0;
+        let relatedEntityOrProject = null;
+
+        // Try parsing content in case it is serialized JSON (from CopilotService)
+        try {
+          const parsed = JSON.parse(mem.content);
+          if (parsed && typeof parsed === 'object') {
+            title = parsed.title || title;
+            content = parsed.body || parsed.content || content;
+            insightType = parsed.type || parsed.insightType || insightType;
+            recommendation = parsed.recommendation || recommendation;
+            strength = parsed.strength !== undefined ? Number(parsed.strength) : strength;
+            relatedEntityOrProject = parsed.relatedEntityOrProject || relatedEntityOrProject;
+          }
+        } catch (e) {
+          // Content is not JSON, it's a plain string from InsightEngine
+          const meta = mem.metadata as any;
+          title = meta?.title || title;
+          recommendation = meta?.recommendation || recommendation;
+          insightType = meta?.type || insightType;
+          strength = meta?.strength || strength;
+          relatedEntityOrProject = meta?.relatedEntityOrProject || null;
+        }
+
         return {
           ...mem,
-          title: meta?.title || 'Cognitive Insight',
-          recommendation: meta?.recommendation || '',
-          insightType: meta?.type || 'behavioral',
-          strength: meta?.strength || 1.0,
-          relatedEntityOrProject: meta?.relatedEntityOrProject || null,
+          content,
+          title,
+          recommendation,
+          insightType,
+          strength,
+          relatedEntityOrProject,
           project: null,
           rawContent: null,
           sentiment: 'neutral',
@@ -55,6 +83,7 @@ export class TimelineService {
     const connections = await TimelineRepository.getMemoryConnections(memoryId);
     const entities = connections.filter(r => r.node_type === 'entity').map(r => r.content);
     const project = connections.find(r => r.node_type === 'project')?.content || null;
+    const rawThoughtId = connections.find(r => r.node_type === 'raw_thought')?.id || null;
 
     let relatedMemories: any[] = [];
     if (memory.embedding) {
@@ -69,6 +98,7 @@ export class TimelineService {
         rawContent: meta?.rawContent || memory.content,
         sentiment: meta?.sentiment || 'neutral',
         moodScore: meta?.moodScore || 5,
+        rawThoughtId,
         project,
         entities,
         createdAt: memory.createdAt,

@@ -8,10 +8,22 @@ const router = Router();
 const deepDiveService = new DeepDiveService();
 
 router.use(authMiddleware);
-router.use(checkQuota('deepdive'));
+
+// GET /deepdive/:rawThoughtId
+router.get('/:rawThoughtId', asyncHandler(async (req: any, res: any) => {
+  const userId = req.userId;
+  const { rawThoughtId } = req.params;
+
+  if (!userId) {
+    return res.status(400).json({ error: 'Missing userId' });
+  }
+
+  const result = await deepDiveService.getThoughtHistory(userId, rawThoughtId);
+  res.json(result);
+}));
 
 // POST /deepdive/:rawThoughtId/chat
-router.post('/:rawThoughtId/chat', asyncHandler(async (req: any, res: any) => {
+router.post('/:rawThoughtId/chat', checkQuota('deepdive'), asyncHandler(async (req: any, res: any) => {
   const userId = req.userId;
   const { rawThoughtId } = req.params;
   const { message } = req.body;

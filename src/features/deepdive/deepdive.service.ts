@@ -5,6 +5,50 @@ import { llm } from '../../services/llm.service.js';
 import { incrementUsage } from '../../core/middlewares/quota.middleware.js';
 
 export class DeepDiveService {
+  async getThoughtHistory(userId: string, rawThoughtId: string) {
+    // 1. Verify thought belongs to user
+    const thoughtQuery = await db.execute(sql`
+      SELECT id, content FROM nodes 
+      WHERE id = ${rawThoughtId} AND user_id = ${userId} AND node_type = 'raw_thought'
+    `);
+    const rawThought = thoughtQuery.rows[0];
+    if (!rawThought) throw new Error('Thought not found');
+
+    // 2. Fetch the current summary memory node linked to this thought
+    const summaryQuery = await db.execute(sql`
+      SELECT n.id, n.content 
+      FROM nodes n
+      JOIN edges e ON e.source_node_id = n.id
+      WHERE e.target_node_id = ${rawThoughtId} 
+      AND e.relation_type = 'summarizes' 
+      AND n.node_type = 'memory'
+      LIMIT 1
+    `);
+    const summaryNode = summaryQuery.rows[0];
+
+    // 3. Fetch past conversation turns for this thought
+    const historyQuery = await db.execute(sql`
+      SELECT n.content, n.metadata 
+      FROM nodes n
+      JOIN edges e ON e.source_node_id = n.id
+      WHERE e.target_node_id = ${rawThoughtId} 
+      AND e.relation_type = 'discusses' 
+      AND n.node_type = 'conversation_turn'
+      ORDER BY n.created_at ASC
+    `);
+
+    const history = historyQuery.rows.map(r => ({
+      role: (r.metadata as any)?.role || 'user',
+      content: r.content
+    }));
+
+    return {
+      rawThought: rawThought.content,
+      summary: summaryNode?.content || '',
+      history
+    };
+  }
+
   async chatWithThought(userId: string, rawThoughtId: string, message: string) {
     // 1. Verify thought belongs to user
     const thoughtQuery = await db.execute(sql`

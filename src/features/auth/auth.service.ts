@@ -8,14 +8,14 @@ import { users } from '../../db/schema.js';
 import { eq } from 'drizzle-orm';
 
 export class AuthService {
-  static async register(email: string, password: string) {
+  static async register(email: string, password: string, timezone?: string) {
     if (!email || !password) throw new AppError('Email and password required', 400);
 
     const existingUser = await AuthRepository.findUserByEmail(email);
     if (existingUser) throw new AppError('Email already exists', 400);
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const user = await AuthRepository.createUser(email, passwordHash);
+    const user = await AuthRepository.createUser(email, passwordHash, timezone);
     
     if (!user) throw new AppError('Failed to create user', 500);
 
@@ -23,7 +23,7 @@ export class AuthService {
     return { token, userId: user.id };
   }
 
-  static async login(email: string, password: string) {
+  static async login(email: string, password: string, timezone?: string) {
     if (!email || !password) throw new AppError('Email and password required', 400);
 
     const user = await AuthRepository.findUserByEmail(email);
@@ -32,6 +32,11 @@ export class AuthService {
 
     const isValid = await bcrypt.compare(password, user.passwordHash);
     if (!isValid) throw new AppError('Invalid credentials', 401);
+
+    // Sync timezone on login if provided
+    if (timezone && user.timezone !== timezone) {
+      await db.update(users).set({ timezone }).where(eq(users.id, user.id));
+    }
 
     const token = jwt.sign({ userId: user.id }, env.JWT_SECRET, { expiresIn: '30d' });
     return { token, userId: user.id };
@@ -53,5 +58,16 @@ export class AuthService {
 
     if (!user) throw new AppError('User not found', 404);
     return user;
+  }
+
+  static async upgradeToPro(userId: string) {
+    const [updatedUser] = await db
+      .update(users)
+      .set({ tier: 'pro' })
+      .where(eq(users.id, userId))
+      .returning({ id: users.id, tier: users.tier });
+
+    if (!updatedUser) throw new AppError('User not found', 404);
+    return updatedUser;
   }
 }

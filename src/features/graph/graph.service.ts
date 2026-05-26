@@ -13,11 +13,33 @@ export class GraphService {
       const edgeCount = allEdges.filter((e: any) => e.source_node_id === n.id || e.target_node_id === n.id).length;
       if (edgeCount > 2) heat = Math.min(1.0, heat + (edgeCount * 0.05));
 
+      let content = n.content;
+      let label = content;
+
+      if (n.nodeType === 'insight') {
+        try {
+          const parsed = JSON.parse(n.content);
+          if (parsed && typeof parsed === 'object') {
+            label = parsed.title || parsed.body || parsed.content || n.content;
+            content = parsed.body || parsed.content || n.content;
+          }
+        } catch (e) {
+          const meta = n.metadata as any;
+          if (meta?.title) {
+            label = meta.title;
+          }
+        }
+      }
+
+      if (label.length > 50) {
+        label = label.substring(0, 50) + '...';
+      }
+
       return {
         id: n.id,
         type: n.nodeType,
-        label: n.content.length > 50 ? n.content.substring(0, 50) + '...' : n.content,
-        content: n.content,
+        label,
+        content,
         heat: parseFloat(heat.toFixed(2)),
       };
     });

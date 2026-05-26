@@ -10,6 +10,7 @@ export class GraphRepository {
         nodeType: nodes.nodeType,
         content: nodes.content,
         createdAt: nodes.createdAt,
+        metadata: nodes.metadata,
       })
       .from(nodes)
       .where(eq(nodes.userId, userId));

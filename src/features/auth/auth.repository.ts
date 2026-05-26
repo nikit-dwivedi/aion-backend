@@ -8,8 +8,8 @@ export class AuthRepository {
     return user;
   }
 
-  static async createUser(email: string, passwordHash: string) {
-    const [user] = await db.insert(users).values({ email, passwordHash }).returning();
+  static async createUser(email: string, passwordHash: string, timezone?: string) {
+    const [user] = await db.insert(users).values({ email, passwordHash, ...(timezone ? { timezone } : {}) }).returning();
     return user;
   }
 }

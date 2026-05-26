@@ -195,6 +195,9 @@ async function generateInsightsForUser(userId: string) {
 
       if (relatedNodes.length > 0) {
         const targetNode = relatedNodes[0];
+        if (!insertedNode || !targetNode) {
+          return;
+        }
         // Create edge from insight to the project/entity
         await db.insert(edges).values({
           sourceNodeId: insertedNode.id,
