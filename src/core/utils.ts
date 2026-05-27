@@ -197,13 +197,149 @@ export function cleanAndParseJson<T = any>(str: string): T {
   // Strip trailing commas outside string literals
   jsonString = stripTrailingCommas(jsonString);
 
+  // Attempt 1: Direct parse
   try {
     return JSON.parse(jsonString) as T;
-  } catch (error: any) {
+  } catch (firstError: any) {
+    // Attempt 2: Strip any 'transcription' field that may contain unescaped content
+    // This regex removes "transcription": "..." including nested quotes by finding
+    // the field and consuming until we find a clean JSON boundary
+    const withoutTranscription = stripProblematicField(jsonString, 'transcription');
+    if (withoutTranscription !== jsonString) {
+      try {
+        return JSON.parse(withoutTranscription) as T;
+      } catch { /* continue to next attempt */ }
+    }
+
+    // Attempt 3: Try to extract key-value pairs with regex-based recovery
+    try {
+      const recovered = regexRecoverJson(jsonString);
+      if (recovered) return recovered as T;
+    } catch { /* continue */ }
+
     console.error('[JSON Parser] Failed to parse cleaned JSON. Original string snippet:', str.substring(0, 100) + '...');
-    console.error('[JSON Parser] Cleaned JSON string:', jsonString);
-    throw new Error(`JSON parse error: ${error.message}`);
+    console.error('[JSON Parser] Cleaned JSON string:', jsonString.substring(0, 500));
+    throw new Error(`JSON parse error: ${firstError.message}`);
   }
+}
+
+/**
+ * Strips a problematic long-string field from a JSON string by finding
+ * its key and carefully removing everything from the key to the next
+ * valid field boundary or closing brace.
+ */
+function stripProblematicField(json: string, fieldName: string): string {
+  // Match "fieldName" : " and then find the end boundary
+  const fieldPattern = new RegExp(`"${fieldName}"\\s*:\\s*"`, 'i');
+  const match = fieldPattern.exec(json);
+  if (!match) return json;
+
+  const fieldStart = match.index;
+  const valueStart = fieldStart + match[0].length;
+  
+  // Walk forward from valueStart to find the end of the string value
+  // Look for an unescaped quote followed by , or } (the next field boundary)
+  let i = valueStart;
+  while (i < json.length) {
+    if (json[i] === '\\' && i + 1 < json.length) {
+      i += 2; // skip escaped character
+      continue;
+    }
+    if (json[i] === '"') {
+      // Check what comes after this closing quote (ignoring whitespace)
+      let j = i + 1;
+      while (j < json.length && /\s/.test(json[j]!)) j++;
+      if (j < json.length && (json[j] === ',' || json[j] === '}')) {
+        // Found the proper end of this string value
+        const endIdx = json[j] === ',' ? j + 1 : j; // include comma if present
+        return json.substring(0, fieldStart) + json.substring(endIdx);
+      }
+    }
+    i++;
+  }
+
+  return json; // couldn't find clean boundary, return unchanged
+}
+
+/**
+ * Last-resort recovery: extract known fields using targeted regexes
+ * and reconstruct a valid JSON object from them.
+ */
+function regexRecoverJson(json: string): Record<string, any> | null {
+  const extractString = (key: string): string | null => {
+    // Match "key": "value" — take the shortest non-greedy match that ends at ",\n or "\n}
+    const pattern = new RegExp(`"${key}"\\s*:\\s*"([^"]{0,500})"`, 'i');
+    const m = pattern.exec(json);
+    return m ? m[1]! : null;
+  };
+
+  const extractNumber = (key: string): number | null => {
+    const pattern = new RegExp(`"${key}"\\s*:\\s*(\\d+)`, 'i');
+    const m = pattern.exec(json);
+    return m ? parseInt(m[1]!, 10) : null;
+  };
+
+  const extractBoolean = (key: string): boolean | null => {
+    const pattern = new RegExp(`"${key}"\\s*:\\s*(true|false)`, 'i');
+    const m = pattern.exec(json);
+    return m ? m[1] === 'true' : null;
+  };
+
+  const extractArray = (key: string): string[] | null => {
+    const pattern = new RegExp(`"${key}"\\s*:\\s*\\[([^\\]]{0,2000})\\]`, 'i');
+    const m = pattern.exec(json);
+    if (!m) return null;
+    try {
+      return JSON.parse(`[${m[1]}]`);
+    } catch {
+      // Extract quoted strings manually
+      const items: string[] = [];
+      const itemPattern = /"([^"]+)"/g;
+      let im;
+      while ((im = itemPattern.exec(m[1]!)) !== null) {
+        items.push(im[1]!);
+      }
+      return items.length > 0 ? items : [];
+    }
+  };
+
+  const summary = extractString('summary');
+  if (!summary) return null; // Can't recover without at least a summary
+
+  const result: Record<string, any> = { summary };
+  
+  const project = extractString('project');
+  if (project) result.project = project;
+  
+  const subproject = extractString('subproject');
+  result.subproject = subproject; // can be null
+  
+  const entities = extractArray('entities');
+  result.entities = entities || [];
+  
+  const people = extractArray('people');
+  result.people = people || [];
+  
+  const contradictions = extractArray('contradictions');
+  result.contradictions = contradictions || [];
+  
+  const actionItems = extractArray('action_items');
+  result.action_items = actionItems || [];
+  
+  const sentiment = extractString('sentiment');
+  result.sentiment = sentiment || 'neutral';
+  
+  const moodScore = extractNumber('mood_score');
+  result.mood_score = moodScore || 5;
+  
+  const requiresResearch = extractBoolean('requires_research');
+  result.requires_research = requiresResearch || false;
+  
+  const researchQuery = extractString('research_query');
+  result.research_query = researchQuery;
+
+  console.warn('[JSON Parser] Recovered JSON via regex fallback:', Object.keys(result).join(', '));
+  return result;
 }
 
 /**

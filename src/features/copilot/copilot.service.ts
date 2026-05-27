@@ -12,22 +12,39 @@ export class CopilotService {
     if (recentMemories.length < 3) return [];
 
     const allProjects = await CopilotRepository.getAllProjects(userId);
-    const memoriesText = recentMemories.map((m, i) => `[M${i + 1}] [${m.createdAt?.toISOString?.() ?? ''}] ${m.content}`).join('\n');
+    const memoriesText = recentMemories.map((m, i) => `[Memory #${i + 1}] [${m.createdAt?.toISOString?.() ?? ''}] ${m.content}`).join('\n');
     const projectsText = allProjects.map(p => p.content).join(', ');
 
     const prompt = `You are AION, an advanced cognitive copilot analyzing patterns in user thoughts.
 
-Here are user memories (labeled [M1], [M2], etc.):
+Here are user memories (numbered 1, 2, 3, etc.):
 ${memoriesText}
 
 Known projects: ${projectsText || 'None'}
 
 Produce 3-5 proactive insights. Types: "pattern", "reminder", "connection", "suggestion".
-Return JSON array with: type, title (max 10 words), body (1-2 sentences), urgency ("low"/"medium"/"high"), sources (array of memory index numbers this insight is based on, e.g. [1, 5, 12]).
-Output ONLY raw JSON array.`;
+Return a JSON array. Each element must have these fields:
+- "type": one of "pattern", "reminder", "connection", "suggestion"
+- "title": string, max 10 words
+- "body": string, 1-2 sentences
+- "urgency": one of "low", "medium", "high"
+- "sources": array of INTEGER memory numbers (e.g. [1, 5, 12]). IMPORTANT: use plain integers only, do NOT use prefixes like "M1" or "#1" — just the number.
+
+Output ONLY the raw JSON array, no markdown, no explanation.`;
 
     let aiResponse = await llm.generateContent({ prompt });
-    // This endpoint returns a JSON array, so extract array brackets
+
+    // Sanitize: strip M/m/# prefixes from sources arrays before parsing
+    // Handles cases like "sources": [M2, M3] or "sources": ["M2", "M3"]
+    aiResponse = aiResponse.replace(
+      /"sources"\s*:\s*\[([^\]]*)\]/g,
+      (_match: string, inner: string) => {
+        const cleaned = inner.replace(/["']?\s*[Mm#](\d+)\s*["']?/g, '$1');
+        return `"sources": [${cleaned}]`;
+      }
+    );
+
+    // Extract JSON array brackets
     const si = aiResponse.indexOf('['), ei = aiResponse.lastIndexOf(']');
     if (si !== -1 && ei !== -1) aiResponse = aiResponse.substring(si, ei + 1);
     

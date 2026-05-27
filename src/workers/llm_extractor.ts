@@ -121,6 +121,10 @@ async function processEventById(eventId: string): Promise<void> {
     `);
     const recentText = recentMems.rows.map((r: any, i: number) => `${i + 1}. ${r.content}`).join('\n');
 
+    // NOTE: 'transcription' is deliberately NOT in the JSON schema.
+    // Asking the LLM to echo raw content (web pages, articles, audio) inside JSON
+    // causes chronic parse failures due to unescaped quotes/special chars.
+    // Instead, we capture transcription separately as plain text.
     const promptInstruction = `
       You are AION, extracting structured metadata from a new thought.
       Here are the user's recent thoughts for context:
@@ -138,12 +142,28 @@ async function processEventById(eventId: string): Promise<void> {
       - mood_score: An integer from 1 to 10 (1=very negative, 5=neutral, 10=very positive).
       - requires_research: A boolean. true if this thought mentions a topic, concept, or question that could benefit from web research to provide more context or answer the user's curiosity. false otherwise.
       - research_query: If requires_research is true, a short web search query string (max 10 words) to find relevant information. null if false.
-      Output ONLY raw JSON without markdown formatting.
+      Do NOT include a transcription field. Output ONLY raw JSON without markdown formatting.
     `;
 
     let aiResponse: string;
+    let transcription: string | null = null;
 
     if ((payload.type === 'audio' || payload.type === 'image') && payload.mediaBase64) {
+      // Step 1: Get transcription as plain text (separate call — no JSON formatting risks)
+      const transcriptionPrompt = payload.type === 'audio'
+        ? 'Provide an exact word-for-word transcription of the spoken words in this audio. Output ONLY the transcription text, nothing else.'
+        : 'Provide a detailed description of the text and visual elements in this image. Output ONLY the description text, nothing else.';
+      try {
+        transcription = (await llm.generateContent({
+          prompt: transcriptionPrompt,
+          mediaBuffer: payload.mediaBase64,
+          mimeType: payload.mimeType,
+        })).trim();
+      } catch (e) {
+        console.warn('[Extractor] Transcription extraction failed, continuing without:', (e as Error).message);
+      }
+
+      // Step 2: Get structured metadata (JSON) — transcription is NOT part of this output
       aiResponse = await llm.generateContent({
         systemInstruction: payload.type === 'audio' ? 'Listen to this audio thought.' : 'Analyze this image thought.',
         prompt: promptInstruction,
@@ -151,6 +171,8 @@ async function processEventById(eventId: string): Promise<void> {
         mimeType: payload.mimeType,
       });
     } else {
+      // For text inputs, the raw content IS the transcription — no LLM call needed
+      transcription = payload.content || null;
       aiResponse = await llm.generateContent({
         prompt: `Analyze this thought: "${payload.content}"\n${promptInstruction}`
       });
@@ -160,9 +182,11 @@ async function processEventById(eventId: string): Promise<void> {
     let finalSummary = parsed.summary;
     let embeddingVector = await llm.embedContent(finalSummary);
 
-    // Perform Similarity Search to find related past memories
+    const initialRawContent = transcription || payload.content || (payload.type === 'audio' ? '[Audio Thought]' : payload.type === 'image' ? '[Image Thought]' : '[Media Thought]');
+
+    // Perform Similarity Search to find related past memories (including metadata)
     const similarNodes = await db.execute(sql`
-      SELECT id, content, 1 - (embedding <=> ${JSON.stringify(embeddingVector)}::vector) as similarity
+      SELECT id, content, metadata, 1 - (embedding <=> ${JSON.stringify(embeddingVector)}::vector) as similarity
       FROM nodes
       WHERE node_type = 'memory' AND user_id = ${userId}
       ORDER BY embedding <=> ${JSON.stringify(embeddingVector)}::vector
@@ -174,7 +198,7 @@ async function processEventById(eventId: string): Promise<void> {
       const [rawThoughtNode] = await tx.insert(nodes).values({
         userId,
         nodeType: 'raw_thought',
-        content: payload.content || '[Media Thought]',
+        content: payload.content || parsed.transcription || '[Media Thought]',
         metadata: { originalEventId: eventId, type: payload.type }
       }).returning();
 
@@ -205,11 +229,18 @@ async function processEventById(eventId: string): Promise<void> {
         // Generate new embedding for the merged content
         embeddingVector = await llm.embedContent(mergedContent);
 
+        // Preserve and back-populate the original initial thought in metadata
+        const existingMeta = { ...(topMatch.metadata as any || {}) };
+        if (!existingMeta.rawContent) {
+          existingMeta.rawContent = topMatch.content;
+        }
+
         // Update existing memory node
         await tx.execute(sql`
           UPDATE nodes
           SET content = ${mergedContent},
               embedding = ${JSON.stringify(embeddingVector)}::vector,
+              metadata = ${JSON.stringify(existingMeta)}::jsonb,
               updated_at = NOW()
           WHERE id = ${memoryNodeId}
         `);
@@ -224,6 +255,7 @@ async function processEventById(eventId: string): Promise<void> {
             originalEventId: eventId, 
             sentiment: parsed.sentiment || 'neutral',
             moodScore: parsed.mood_score || 5,
+            rawContent: initialRawContent,
           }
         }).returning();
 
@@ -269,14 +301,32 @@ async function processEventById(eventId: string): Promise<void> {
         return newNode.id;
       };
 
+      const linkMemoryToProject = async (memId: string, projId: string) => {
+        const existingBelongsTo = await tx.execute(sql`
+          SELECT id FROM edges
+          WHERE source_node_id = ${memId}
+          AND target_node_id = ${projId}
+          AND relation_type = 'belongs_to'
+          LIMIT 1
+        `);
+        if (existingBelongsTo.rows.length === 0) {
+          await tx.insert(edges).values({
+            sourceNodeId: memId,
+            targetNodeId: projId,
+            relationType: 'belongs_to',
+          });
+        }
+      };
+
       // Project/Subproject Resolution
       if (parsed.project) {
         const projectId = await resolveNode('project', parsed.project);
-        let activeProjectId = projectId;
+        
+        // Link memory to the main project
+        await linkMemoryToProject(memoryNodeId, projectId);
 
         if (parsed.subproject) {
           const subprojectId = await resolveNode('project', parsed.subproject);
-          activeProjectId = subprojectId;
 
           // Link subproject to parent project
           const existingEdge = await tx.execute(sql`
@@ -293,14 +343,10 @@ async function processEventById(eventId: string): Promise<void> {
               relationType: 'subproject_of',
             });
           }
-        }
 
-        // Link memory to active project
-        await tx.insert(edges).values({
-          sourceNodeId: memoryNodeId,
-          targetNodeId: activeProjectId,
-          relationType: 'belongs_to',
-        });
+          // Link memory to the subproject too!
+          await linkMemoryToProject(memoryNodeId, subprojectId);
+        }
       }
 
       if (parsed.entities && Array.isArray(parsed.entities)) {
