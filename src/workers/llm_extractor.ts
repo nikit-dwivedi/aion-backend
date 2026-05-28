@@ -204,11 +204,16 @@ async function processEventById(eventId: string): Promise<void> {
     const initialRawContent = transcription || payload.content || '[Media Thought]';
 
     // Cosine similarity search using cosine distance operator <=>
+    const vectorString = `[${embeddingVector.join(",")}]`;
+console.log("Embedding dimension:", embeddingVector.length);
     const similarNodes = await db.execute(sql`
-      SELECT id, content, metadata, 1 - (embedding <=> ${sql.raw(JSON.stringify(embeddingVector))}::vector) as similarity
+      SELECT id, content, metadata,
+            1 - (embedding <=> ${vectorString}::vector) AS similarity
       FROM nodes
-      WHERE node_type = 'memory' AND user_id = ${userId}
-      ORDER BY embedding <=> ${sql.raw(JSON.stringify(embeddingVector))}::vector
+      WHERE node_type = 'memory'
+        AND user_id = ${userId}
+        AND embedding IS NOT NULL
+      ORDER BY embedding <=> ${vectorString}::vector
       LIMIT 3
     `);
 
@@ -249,12 +254,14 @@ async function processEventById(eventId: string): Promise<void> {
         if (!existingMeta.rawContent) {
           existingMeta.rawContent = topMatch.content;
         }
+        const vectorString = `[${embeddingVector.join(",")}]`;
+        const metadataString = JSON.stringify(existingMeta);
 
         await tx.execute(sql`
           UPDATE nodes
           SET content = ${finalSummary},
-              embedding = ${sql.raw(JSON.stringify(embeddingVector))}::vector,
-              metadata = ${sql.raw(JSON.stringify(existingMeta))}::jsonb,
+              embedding = ${vectorString}::vector,
+              metadata = ${metadataString}::jsonb,
               updated_at = NOW()
           WHERE id = ${memoryNodeId}
         `);

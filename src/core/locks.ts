@@ -19,7 +19,7 @@ export async function withAdvisoryLock<T>(
   callback: (tx: any) => Promise<T>
 ): Promise<T | null> {
   return await db.transaction(async (tx) => {
-    const lockRes = await tx.execute(sql`SELECT pg_try_xact_advisory_lock(${key}) as acquired`);
+    const lockRes = await tx.execute(sql`SELECT pg_try_advisory_xact_lock(${key}) as acquired`);
     const acquired = lockRes.rows[0]?.acquired;
     if (!acquired) {
       console.warn(`[Lock] Could not acquire transaction advisory lock for key ${key}. Concurrency protection active.`);
