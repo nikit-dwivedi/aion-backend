@@ -9,6 +9,61 @@ export interface AIConnectorOptions {
   systemInstruction?: string;
   mediaBuffer?: string; // base64 string
   mimeType?: string;
+  subsystem?: 'extractor' | 'orchestration' | 'research' | 'clustering' | 'contradiction' | 'episode' | 'insight';
+  priority?: string;
+}
+
+interface QueueTask<T> {
+  priority: number;
+  run: () => Promise<T>;
+  resolve: (value: T) => void;
+  reject: (err: any) => void;
+}
+
+class LLMInferenceQueue {
+  private activeCount = 0;
+  private maxConcurrency = 3;
+  private taskQueue: QueueTask<any>[] = [];
+
+  async enqueue<T>(priority: number, run: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.taskQueue.push({ priority, run, resolve, reject });
+      this.taskQueue.sort((a, b) => b.priority - a.priority);
+      this.next();
+    });
+  }
+
+  private next() {
+    if (this.activeCount >= this.maxConcurrency) return;
+    const task = this.taskQueue.shift();
+    if (!task) return;
+
+    this.activeCount++;
+    task.run()
+      .then(res => {
+        task.resolve(res);
+      })
+      .catch(err => {
+        task.reject(err);
+      })
+      .finally(() => {
+        this.activeCount--;
+        this.next();
+      });
+  }
+}
+
+function getTaskPriority(options: AIConnectorOptions): number {
+  if (options.subsystem === 'extractor') return 5;
+  if (options.subsystem === 'orchestration' || options.subsystem === 'research') return 3;
+  if (options.subsystem === 'clustering' || options.subsystem === 'episode' || options.subsystem === 'contradiction') return 1;
+
+  const prio = (options.priority || '').toLowerCase();
+  if (prio === 'critical' || prio === 'urgent') return 5;
+  if (prio === 'important' || prio === 'normal' || prio === 'high') return 3;
+  if (prio === 'background' || prio === 'low_priority_evolution' || prio === 'low') return 1;
+
+  return 3;
 }
 
 export type ProviderType = 'gemini' | 'openai' | 'ollama';
@@ -16,6 +71,7 @@ export type ProviderType = 'gemini' | 'openai' | 'ollama';
 export class AIConnectorService {
   private primaryProvider: ProviderType;
   private providersOrder: ProviderType[];
+  private inferenceQueue = new LLMInferenceQueue();
 
   // Clients
   private geminiClient: GoogleGenAI | null = null;
@@ -91,61 +147,66 @@ export class AIConnectorService {
   }
 
   async generateContentWithMetrics(options: AIConnectorOptions): Promise<{ text: string, usage: { promptTokens: number, completionTokens: number } }> {
-    const errors: Error[] = [];
+    const priorityWeight = getTaskPriority(options);
+    console.log(`[AIConnector] Enqueueing LLM request. Subsystem: ${options.subsystem || 'unknown'} | Priority: ${options.priority || 'normal'} (weight: ${priorityWeight})`);
 
-    // Make options mutable so we can normalize MIME type
-    const normalizedOptions = { ...options };
+    return this.inferenceQueue.enqueue(priorityWeight, async () => {
+      const errors: Error[] = [];
 
-    if (normalizedOptions.mediaBuffer) {
-      let mime = normalizedOptions.mimeType || '';
-      if (!mime || mime === 'application/octet-stream') {
-        const isAudio = (normalizedOptions.systemInstruction && /audio|voice|speech|listen/i.test(normalizedOptions.systemInstruction)) ||
-                        (normalizedOptions.prompt && /audio|voice|speech|listen/i.test(normalizedOptions.prompt));
-        mime = isAudio ? 'audio/mp4' : 'image/jpeg';
+      // Make options mutable so we can normalize MIME type
+      const normalizedOptions = { ...options };
+
+      if (normalizedOptions.mediaBuffer) {
+        let mime = normalizedOptions.mimeType || '';
+        if (!mime || mime === 'application/octet-stream') {
+          const isAudio = (normalizedOptions.systemInstruction && /audio|voice|speech|listen/i.test(normalizedOptions.systemInstruction)) ||
+                          (normalizedOptions.prompt && /audio|voice|speech|listen/i.test(normalizedOptions.prompt));
+          mime = isAudio ? 'audio/mp4' : 'image/jpeg';
+        }
+        normalizedOptions.mimeType = mime;
       }
-      normalizedOptions.mimeType = mime;
-    }
 
-    let providers = [...this.providersOrder];
-    if (normalizedOptions.mediaBuffer) {
-      const multimodal: ProviderType[] = [];
-      const others: ProviderType[] = [];
-      for (const p of providers) {
-        if (p === 'gemini' || p === 'openai') {
-          multimodal.push(p);
-        } else {
-          others.push(p);
+      let providers = [...this.providersOrder];
+      if (normalizedOptions.mediaBuffer) {
+        const multimodal: ProviderType[] = [];
+        const others: ProviderType[] = [];
+        for (const p of providers) {
+          if (p === 'gemini' || p === 'openai') {
+            multimodal.push(p);
+          } else {
+            others.push(p);
+          }
+        }
+        providers = [...multimodal, ...others];
+      }
+
+      for (const provider of providers) {
+        try {
+          if (!this.isProviderConfigured(provider)) {
+            console.log(`[AIConnector] Skipping unconfigured provider: ${provider}`);
+            continue;
+          }
+
+          console.log(`[AIConnector] Attempting content generation with provider: ${provider}`);
+          
+          const response = await this.executeWithRetry(provider, () => 
+            this.callProviderGenerate(provider, normalizedOptions)
+          );
+
+          if (response && (response.text || response.text === '')) {
+            return {
+              text: response.text,
+              usage: response.usage || { promptTokens: 0, completionTokens: 0 }
+            };
+          }
+        } catch (err: any) {
+          console.error(`[AIConnector] Provider ${provider} failed:`, err?.message || err);
+          errors.push(err);
         }
       }
-      providers = [...multimodal, ...others];
-    }
 
-    for (const provider of providers) {
-      try {
-        if (!this.isProviderConfigured(provider)) {
-          console.log(`[AIConnector] Skipping unconfigured provider: ${provider}`);
-          continue;
-        }
-
-        console.log(`[AIConnector] Attempting content generation with provider: ${provider}`);
-        
-        const response = await this.executeWithRetry(provider, () => 
-          this.callProviderGenerate(provider, normalizedOptions)
-        );
-
-        if (response && (response.text || response.text === '')) {
-          return {
-            text: response.text,
-            usage: response.usage || { promptTokens: 0, completionTokens: 0 }
-          };
-        }
-      } catch (err: any) {
-        console.error(`[AIConnector] Provider ${provider} failed:`, err?.message || err);
-        errors.push(err);
-      }
-    }
-
-    throw new Error(`AIConnector failed across all configured providers. Errors: [${errors.map(e => e.message).join(', ')}]`);
+      throw new Error(`AIConnector failed across all configured providers. Errors: [${errors.map(e => e.message).join(', ')}]`);
+    });
   }
 
   /**

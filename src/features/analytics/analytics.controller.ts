@@ -26,4 +26,12 @@ export class AnalyticsController {
     const forecast = await AnalyticsService.getForecast(userId);
     res.json({ forecast });
   }
+
+  static async getCognitionDashboard(req: Request, res: Response) {
+    const userId = req.userId;
+    if (!userId) throw new AppError('Unauthorized', 401);
+
+    const result = await AnalyticsService.getCognitionDashboard(userId);
+    res.json(result);
+  }
 }

@@ -1,9 +1,11 @@
 import { db } from '../../db/index.js';
-import { nodes, events, edges } from '../../db/schema.js';
+import { nodes, edges } from '../../db/schema.js';
 import { sql, eq, and } from 'drizzle-orm';
 import { llm } from '../../services/llm.service.js';
 import { incrementUsage } from '../../core/middlewares/quota.middleware.js';
 import { cleanAndParseJson } from '../../core/utils.js';
+import { embeddingService } from '../../services/embedding.service.js';
+import { insertEvent } from '../../core/events.js';
 
 export class DeepDiveService {
   async getThoughtHistory(userId: string, rawThoughtId: string) {
@@ -138,12 +140,12 @@ export class DeepDiveService {
 
       // Overwrite Summary if it changed
       if (summaryNode && summaryNode.content !== parsed.new_summary) {
-        const newEmbedding = await llm.embedContent(parsed.new_summary);
+        const newEmbedding = await embeddingService.generateEmbedding(parsed.new_summary);
         await tx.update(nodes)
           .set({ content: parsed.new_summary, embedding: newEmbedding, updatedAt: new Date() })
           .where(eq(nodes.id, summaryNode.id as string));
         
-        await tx.insert(events).values({
+        await insertEvent(tx, {
           userId,
           eventType: 'thought_updated',
           payload: { rawThoughtId, oldSummary: summaryNode.content, newSummary: parsed.new_summary }
@@ -151,7 +153,7 @@ export class DeepDiveService {
       }
 
       // Log deep dive event
-      await tx.insert(events).values({
+      await insertEvent(tx, {
         userId,
         eventType: 'deep_dive_chat',
         payload: { rawThoughtId, message, response: parsed.response }

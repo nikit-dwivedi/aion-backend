@@ -2,13 +2,14 @@ import { SearchRepository } from './search.repository.js';
 import { llm } from '../../services/llm.service.js';
 import { env } from '../../config/env.js';
 import { AppError } from '../../core/middlewares/error.middleware.js';
+import { embeddingService } from '../../services/embedding.service.js';
 
 export class SearchService {
   static async searchMemories(query: string) {
     if (!query) throw new AppError('Missing query', 400);
     if (!llm.isConfigured) throw new AppError('LLM service is not configured.', 500);
 
-    const queryEmbedding = await llm.embedContent(query);
+    const queryEmbedding = await embeddingService.generateEmbedding(query);
     const similarNodes = await SearchRepository.findSimilarMemories(queryEmbedding, 5);
 
     if (similarNodes.length === 0) {

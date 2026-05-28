@@ -14,6 +14,7 @@ import graphRouter from './features/graph/graph.route.js';
 import exportRouter from './features/export/export.route.js';
 import planningRouter from './features/planning/planning.route.js';
 import deepdiveRouter from './features/deepdive/deepdive.routes.js';
+import notificationRouter from './features/notifications/notification.routes.js';
 
 const app = express();
 
@@ -31,6 +32,7 @@ app.use('/api/graph', graphRouter);
 app.use('/api/export', exportRouter);
 app.use('/api/planning', planningRouter);
 app.use('/api/deepdive', deepdiveRouter);
+app.use('/api/notifications', notificationRouter);
 
 app.use(errorHandler);
 

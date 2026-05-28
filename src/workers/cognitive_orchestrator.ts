@@ -1,35 +1,47 @@
 import { db } from '../db/index.js';
 import { events, nodes, edges, users } from '../db/schema.js';
-import { sql, eq, and, desc } from 'drizzle-orm';
+import { sql, eq } from 'drizzle-orm';
 import { llm } from '../services/llm.service.js';
-import { PgNotifyListener, type NotifyPayload } from '../services/pg_notify_listener.service.js';
+import { queueProvider } from '../core/queue.js';
 import { cleanAndParseJson, normalizeAllUserTimezones } from '../core/utils.js';
+import { withAdvisoryLock, LOCK_PLAN_ORCHESTRATION } from '../core/locks.js';
+import { insertEvent } from '../core/events.js';
+import { CognitionLogger } from '../core/observability.ts';
+import { isEventReadyForRetry } from './llm_extractor.js';
 
 const MAX_RETRIES = 5;
-const DEBOUNCE_WINDOW_MS = 10 * 60 * 1000; // 10 minutes consolidation buffer
+const DEBOUNCE_WINDOW_MS = 10 * 60 * 1000;
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-/**
- * The Cognitive Orchestrator Worker:
- * 1. Scheduled: Generate a fresh daily_plan at ~6:00 AM in each user's local timezone.
- * 2. Reactive & Consolidated: Debounce plan update requests by 10 minutes for standard thoughts,
- *    while executing urgent triggers (emotional spikes, explicit requests) immediately.
- */
 export const startOrchestrationWorker = () => {
   console.log('[Orchestrator] Starting Cognitive Orchestration Worker...');
 
-  // Trigger timezone normalization check asynchronously on startup
   normalizeAllUserTimezones().catch(err => {
     console.error('[Orchestrator] Failed to run timezone normalization:', err);
   });
 
-  // 1. Reactive: LISTEN/NOTIFY push-based processing for plan updates
-  const listener = new PgNotifyListener('aion_plan_queue', handlePlanNotification);
-  listener.start().catch(err => {
-    console.error('[Orchestrator] Failed to start LISTEN/NOTIFY listener:', err);
+  // Subscribe to critical and normal queues
+  queueProvider.subscribe('critical_cognition_queue', async (msg) => {
+    if (msg.eventType === 'plan_update_requested') {
+      try {
+        await processPlanUpdateById(msg.id);
+      } catch (error) {
+        console.error(`[Orchestrator] Critical Plan Update notification error:`, error);
+      }
+    }
   });
 
-  // 2. Scheduled: Check for morning plan generation every 5 minutes
+  queueProvider.subscribe('normal_cognition_queue', async (msg) => {
+    if (msg.eventType === 'plan_update_requested') {
+      try {
+        await processPlanUpdateById(msg.id);
+      } catch (error) {
+        console.error(`[Orchestrator] Normal Plan Update notification error:`, error);
+      }
+    }
+  });
+
+  // Scheduled: check for morning plan generation every 5 minutes
   setInterval(async () => {
     try {
       await generateScheduledPlans();
@@ -38,7 +50,7 @@ export const startOrchestrationWorker = () => {
     }
   }, 5 * 60 * 1000);
 
-  // 3. Fallback & Debounce Sweep: Check for pending/debounced updates every 2 minutes
+  // Fallback and Debounce Sweep
   setInterval(async () => {
     try {
       await sweepPendingPlanUpdates();
@@ -47,16 +59,6 @@ export const startOrchestrationWorker = () => {
     }
   }, 120000);
 };
-
-async function handlePlanNotification(payload: NotifyPayload): Promise<void> {
-  try {
-    await processPlanUpdateById(payload.id);
-  } catch (error) {
-    console.error(`[Orchestrator] Notification handler error for event ${payload.id}:`, error);
-  }
-}
-
-// ─── Scheduled Plan Generation ───────────────────────────────────────────────
 
 async function generateScheduledPlans() {
   if (!llm.isConfigured) return;
@@ -72,84 +74,56 @@ async function generateScheduledPlans() {
     )
   `);
 
-  if (usersNeedingPlan.rows.length === 0) return;
-
   for (const user of usersNeedingPlan.rows) {
     const userId = user.id as string;
-    const tz = user.timezone as string;
-    console.log(`[Orchestrator] Generating daily plan for user ${userId} (${tz})...`);
-
+    console.log(`[Orchestrator] Scheduled plan generation triggered for user ${userId}`);
     try {
       await generatePlanForUser(userId);
-      console.log(`[Orchestrator] Daily plan generated for user ${userId}`);
     } catch (e) {
-      console.error(`[Orchestrator] Failed to generate plan for user ${userId}:`, e);
+      console.error(`[Orchestrator] Scheduled generation failed:`, e);
     }
-
     await delay(3000);
   }
 }
 
-// ─── Reactive Plan Updates (Push & Sweep Debounced) ──────────────────────────
-
 async function sweepPendingPlanUpdates(): Promise<void> {
-  if (!llm.isConfigured) return;
-
-  // Sweep scans for any pending updates. It acts as the consolidator for debounced tasks.
   const pending = await db.execute(sql`
     SELECT id FROM events
     WHERE event_type = 'plan_update_requested'
     AND processing_status IN ('pending', 'retrying')
     AND retry_count < ${MAX_RETRIES}
-    ORDER BY created_at ASC
+    ORDER BY CASE WHEN priority = 'critical' THEN 5 WHEN priority = 'urgent' THEN 4 WHEN priority = 'high' THEN 4 WHEN priority = 'important' THEN 4 WHEN priority = 'normal' THEN 3 WHEN priority = 'background' THEN 2 ELSE 1 END DESC, created_at ASC
   `);
 
-  if (pending.rows.length === 0) return;
-
-  // Process unique users to avoid redundant loops
-  const uniqueEventIds = new Set<string>();
-  const processedUsers = new Set<string>();
-
   for (const row of pending.rows) {
-    const eventId = row.id as string;
-    uniqueEventIds.add(eventId);
-  }
-
-  for (const eventId of uniqueEventIds) {
-    try {
-      await processPlanUpdateById(eventId);
-    } catch (error) {
-      console.error(`[Orchestrator] Sweep processing failed for event ${eventId}:`, error);
-    }
+    await processPlanUpdateById(row.id as string);
   }
 }
 
 async function processPlanUpdateById(eventId: string): Promise<void> {
-  if (!llm.isConfigured) return;
+  const startTime = Date.now();
 
-  const result = await db.execute(sql`
-    SELECT * FROM events
-    WHERE id = ${eventId}
-    AND event_type = 'plan_update_requested'
-    AND processing_status != 'completed'
-    AND processing_status != 'failed'
-    LIMIT 1
+  const selectRes = await db.execute(sql`
+    SELECT * FROM events WHERE id = ${eventId} LIMIT 1
   `);
+  if (selectRes.rows.length === 0) return;
+  const eventRow = selectRes.rows[0] as any;
 
-  if (result.rows.length === 0) return;
+  // 1. Backoff Check
+  if (eventRow.processing_status === 'retrying') {
+    if (!isEventReadyForRetry(new Date(eventRow.created_at), eventRow.retry_count || 0)) {
+      return;
+    }
+  }
 
-  const row = result.rows[0] as any;
-  if (!row) return;
-  const userId = row.user_id as string;
-  const priority = row.priority as string;
-  const requiresImmediateAttention = !!row.requires_immediate_attention;
-  const payload = row.payload as any;
+  const userId = eventRow.user_id as string;
+  const priority = eventRow.priority as string;
+  const requiresImmediateAttention = !!eventRow.requires_immediate_attention;
+  const payload = eventRow.payload as any;
 
-  // 1. Debounce Gating for Low/Normal Priority Events
+  // 2. Debounce Gating
   const isUrgent = priority === 'urgent' || priority === 'critical' || requiresImmediateAttention;
-
   if (!isUrgent) {
-    // Check the oldest pending request for this user
     const oldestPendingResult = await db.execute(sql`
       SELECT created_at FROM events
       WHERE user_id = ${userId}
@@ -164,145 +138,156 @@ async function processPlanUpdateById(eventId: string): Promise<void> {
       : new Date();
 
     const ageMs = Date.now() - oldestPendingTime.getTime();
-
-    // If oldest event in buffer is newer than DEBOUNCE_WINDOW_MS, skip for now.
-    // The sweep worker running every 2 minutes will re-evaluate once the threshold is crossed.
     if (ageMs < DEBOUNCE_WINDOW_MS) {
-      console.log(`[Orchestrator] Debouncing plan update for user ${userId}. Age: ${Math.round(ageMs / 1000)}s / ${DEBOUNCE_WINDOW_MS / 1000}s. Skipping.`);
-      return;
+      return; // Skip for now, let sweep handle it later once debounce expires
     }
   }
 
-  // 2. Atomic claim
-  await db.execute(sql`
+  // 3. Atomic claim
+  const claimRes = await db.execute(sql`
     UPDATE events SET processing_status = 'processing'
     WHERE id = ${eventId} AND processing_status IN ('pending', 'retrying')
+    RETURNING *
   `);
 
-  console.log(`[Orchestrator] Processing plan update for user ${userId} (Urgent: ${isUrgent})`);
+  if (claimRes.rows.length === 0) return;
 
   try {
-    const currentPlan = await getTodaysPlan(userId);
+    const lockAcquired = await withAdvisoryLock(LOCK_PLAN_ORCHESTRATION, async (tx) => {
+      const currentPlan = await getTodaysPlan(userId);
 
-    if (!currentPlan) {
-      // Generate daily plan fresh
-      await generatePlanForUser(userId);
-    } else {
-      // Fetch the last generation/update timestamp of this plan
-      const lastPlanTime = currentPlan.updated_at ? new Date(currentPlan.updated_at) : new Date(0);
-
-      // Consolidate: Fetch all memories created since the last plan update
-      const freshMemories = await db.execute(sql`
-        SELECT content FROM nodes
-        WHERE user_id = ${userId}
-        AND node_type = 'memory'
-        AND created_at > ${lastPlanTime}
-        ORDER BY created_at ASC
-      `);
-
-      let newInfo = payload.newInfo || payload.reason || '';
-
-      if (freshMemories.rows.length > 0) {
-        newInfo = freshMemories.rows.map((r: any, idx: number) => `[Thought #${idx + 1}] ${r.content}`).join('\n');
-      }
-
-      const prompt = `
-        You are AION's daily planning engine. The user's current daily plan is:
-        ${currentPlan.content}
-        
-        New information has arrived since the last planning session:
-        "${newInfo}"
-        
-        Does this new information require updating the daily plan? If yes, produce a completely revised plan.
-        If no, return the existing plan unchanged.
-        
-        Return a JSON object:
-        {
-          "changed": true/false,
-          "greeting": "A short motivating message",
-          "schedule": ["Array of time-block strings"],
-          "focusHighlight": "The single most important focus for today"
-        }
-        Output ONLY raw JSON. No markdown.
-      `;
-
-      let aiResponseResult = await llm.generateContentWithMetrics({ prompt });
-      const parsed = cleanAndParseJson(aiResponseResult.text);
-
-      const promptTokens = aiResponseResult.usage?.promptTokens || 0;
-      const completionTokens = aiResponseResult.usage?.completionTokens || 0;
-      const estimatedCost = (promptTokens * 0.000075 + completionTokens * 0.0003) / 1000;
-      const tokenUsage = promptTokens + completionTokens;
-
-      if (parsed.changed) {
-        const updatedContent = JSON.stringify({
-          greeting: parsed.greeting,
-          schedule: parsed.schedule,
-          focusHighlight: parsed.focusHighlight,
-        });
-
-        await db.update(nodes)
-          .set({ content: updatedContent, updatedAt: new Date() })
-          .where(eq(nodes.id, currentPlan.id as string));
-
-        console.log(`[Orchestrator] Plan updated successfully for user ${userId}`);
-
-        // Emit push notification requested event
-        await db.insert(events).values({
-          userId,
-          eventType: 'push_notification_requested',
-          payload: {
-            title: 'Plan Updated',
-            body: `Your daily plan was adjusted: ${parsed.focusHighlight}`,
-            type: 'plan_updated',
-          },
-          priority: 'normal',
-        });
+      if (!currentPlan) {
+        await generatePlanForUser(userId);
       } else {
-        console.log(`[Orchestrator] No plan modifications needed for user ${userId}`);
+        const lastPlanTime = currentPlan.updated_at ? new Date(currentPlan.updated_at) : new Date(0);
+
+        const freshMemories = await tx.execute(sql`
+          SELECT content FROM nodes
+          WHERE user_id = ${userId}
+          AND node_type = 'memory'
+          AND created_at > ${lastPlanTime}
+          ORDER BY created_at ASC
+        `);
+
+        let newInfo = payload.newInfo || payload.reason || '';
+        if (freshMemories.rows.length > 0) {
+          newInfo = freshMemories.rows.map((r: any, idx: number) => `[Thought #${idx + 1}] ${r.content}`).join('\n');
+        }
+
+        const prompt = `
+          You are AION's daily planning engine. The user's current daily plan is:
+          ${currentPlan.content}
+          
+          New information:
+          "${newInfo}"
+          
+          Update the plan if needed. Otherwise return it unchanged.
+          Return a JSON object:
+          {
+            "changed": true/false,
+            "greeting": "Motivating message",
+            "schedule": ["Schedule blocks"],
+            "focusHighlight": "Primary focus"
+          }
+          Output ONLY raw JSON.
+        `;
+
+        let aiResponseResult = await llm.generateContentWithMetrics({
+          prompt,
+          subsystem: 'orchestration',
+          priority: eventRow.priority,
+        });
+        const parsed = cleanAndParseJson(aiResponseResult.text);
+
+        const promptTokens = aiResponseResult.usage?.promptTokens || 0;
+        const completionTokens = aiResponseResult.usage?.completionTokens || 0;
+        const estimatedCost = (promptTokens * 0.000075 + completionTokens * 0.0003) / 1000;
+        const tokenUsage = promptTokens + completionTokens;
+
+        if (parsed.changed) {
+          const updatedContent = JSON.stringify({
+            greeting: parsed.greeting,
+            schedule: parsed.schedule,
+            focusHighlight: parsed.focusHighlight,
+          });
+
+          await tx.update(nodes)
+            .set({ content: updatedContent, updatedAt: new Date() })
+            .where(eq(nodes.id, currentPlan.id as string));
+
+          // Enqueue notification using insertEvent helper
+          await insertEvent(tx, {
+            userId,
+            eventType: 'push_notification_requested',
+            payload: {
+              title: 'Plan Updated',
+              body: `Your daily plan was adjusted: ${parsed.focusHighlight}`,
+              type: 'plan_updated',
+            },
+            priority: 'normal',
+          });
+        }
+
+        // Complete the triggering event
+        await tx.execute(sql`
+          UPDATE events SET 
+            processing_status = 'completed',
+            estimated_cost = ${estimatedCost},
+            token_usage = ${tokenUsage}
+          WHERE user_id = ${userId}
+          AND event_type = 'plan_update_requested'
+          AND processing_status IN ('pending', 'processing', 'retrying')
+        `);
+
+        await insertEvent(tx, {
+          userId,
+          eventType: 'plan_update_processed',
+          payload: { sourcePlanUpdateId: eventId },
+        });
+
+        CognitionLogger.log({
+          subsystem: 'orchestration',
+          action: 'plan_updated',
+          userId,
+          outputs: { changed: parsed.changed, highlight: parsed.focusHighlight },
+          latencyMs: Date.now() - startTime,
+          reason: `Evaluated reactive thoughts and updated daily plan node for user ${userId}`,
+        });
       }
+      return true;
+    });
 
-      // Mark all plan_update_requested events in this debounced consolidation block as completed
+    if (!lockAcquired) {
       await db.execute(sql`
-        UPDATE events SET 
-          processing_status = 'completed',
-          estimated_cost = ${estimatedCost},
-          token_usage = ${tokenUsage}
-        WHERE user_id = ${userId}
-        AND event_type = 'plan_update_requested'
-        AND processing_status IN ('pending', 'processing', 'retrying')
+        UPDATE events
+        SET processing_status = 'retrying'
+        WHERE id = ${eventId}
       `);
-
-      await db.insert(events).values({
-        userId,
-        eventType: 'plan_update_processed',
-        payload: { sourcePlanUpdateId: eventId },
-      });
     }
   } catch (e: any) {
-    const currentRetry = ((row.retry_count as number) || 0) + 1;
-    const newStatus = currentRetry >= MAX_RETRIES ? 'failed' : 'retrying';
-    const errorMessage = e?.message || String(e);
+    const currentRetry = ((eventRow.retry_count as number) || 0) + 1;
+    const isDlq = currentRetry >= MAX_RETRIES;
+    const nextStatus = isDlq ? 'dead_lettered' : 'retrying';
+    const errorMessage = e?.stack || e?.message || String(e);
 
     await db.execute(sql`
       UPDATE events
-      SET processing_status = ${newStatus},
+      SET processing_status = ${nextStatus},
           retry_count = ${currentRetry},
           last_error = ${errorMessage}
       WHERE id = ${eventId}
     `);
 
-    if (newStatus === 'failed') {
-      console.error(`[Orchestrator] Event ${eventId} moved to DLQ after ${MAX_RETRIES} failures. Error: ${errorMessage}`);
+    if (isDlq) {
+      console.error(`[Orchestrator] Event ${eventId} moved to DLQ. Error: ${errorMessage}`);
     } else {
       console.warn(`[Orchestrator] Event ${eventId} failed (attempt ${currentRetry}/${MAX_RETRIES}): ${errorMessage}`);
     }
   }
 }
 
-// ─── Core Plan Generation ────────────────────────────────────────────────────
-
 async function generatePlanForUser(userId: string) {
+  const startTime = Date.now();
   const recentMemories = await db.execute(sql`
     SELECT content FROM nodes
     WHERE user_id = ${userId} AND node_type = 'memory'
@@ -343,37 +328,26 @@ async function generatePlanForUser(userId: string) {
   const tasksText = activeTasks.rows.map((r: any) => `[Goal: ${r.goal}] ${r.task}`).join('\n');
 
   const prompt = `
-    You are AION, generating the user's Daily Focus Plan.
-    
-    Recent thoughts and memories:
-    ${memoriesText || 'No recent thoughts.'}
-    
-    Pending action items (extracted from thoughts):
-    ${actionsText || 'No pending action items.'}
-    
-    Active projects:
-    ${projectsText || 'No active projects.'}
-    
-    Active goal tasks:
-    ${tasksText || 'No active goal tasks.'}
-    
-    Recent autonomous research findings:
-    ${researchText || 'No recent research.'}
-    
-    Generate a realistic, motivating daily plan with 3-7 key focus areas or time-blocks.
-    Weave together action items, goal tasks, and recent insights into a cohesive plan.
-    Prioritize unfinished action items and urgent topics.
-    
-    Return a JSON object:
-    {
-      "greeting": "A short, personal good morning message referencing something specific from their context",
-      "schedule": ["Morning: ...", "Midday: ...", "Afternoon: ...", "Evening: ..."],
-      "focusHighlight": "The single most important thing to accomplish today"
-    }
-    Output ONLY raw JSON. No markdown.
+    Generate Daily Focus Plan.
+    Recent:
+    ${memoriesText}
+    Pending:
+    ${actionsText}
+    Projects:
+    ${projectsText}
+    Tasks:
+    ${tasksText}
+    Research:
+    ${researchText}
+    Return JSON:
+    { "greeting": "...", "schedule": [...], "focusHighlight": "..." }
   `;
 
-  let aiResponseResult = await llm.generateContentWithMetrics({ prompt });
+  let aiResponseResult = await llm.generateContentWithMetrics({
+    prompt,
+    subsystem: 'orchestration',
+    priority: 'normal',
+  });
   const parsed = cleanAndParseJson(aiResponseResult.text);
   const planContent = JSON.stringify(parsed);
 
@@ -382,7 +356,6 @@ async function generatePlanForUser(userId: string) {
   const estimatedCost = (promptTokens * 0.000075 + completionTokens * 0.0003) / 1000;
   const tokenUsage = promptTokens + completionTokens;
 
-  // Upsert daily plan
   const existingPlan = await getTodaysPlan(userId);
 
   await db.transaction(async (tx) => {
@@ -398,8 +371,7 @@ async function generatePlanForUser(userId: string) {
       });
     }
 
-    // Log the completed event
-    await tx.insert(events).values({
+    await insertEvent(tx, {
       userId,
       eventType: 'plan_generated',
       payload: { plan: parsed },
@@ -407,9 +379,16 @@ async function generatePlanForUser(userId: string) {
       tokenUsage
     });
   });
-}
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+  CognitionLogger.log({
+    subsystem: 'orchestration',
+    action: 'plan_generated',
+    userId,
+    outputs: { highlight: parsed.focusHighlight },
+    latencyMs: Date.now() - startTime,
+    reason: `Generated scheduled focus plan node for user ${userId}`,
+  });
+}
 
 async function getTodaysPlan(userId: string) {
   const result = await db.execute(sql`
@@ -420,7 +399,6 @@ async function getTodaysPlan(userId: string) {
     ORDER BY created_at DESC
     LIMIT 1
   `);
-  
   const row = result.rows[0] as any;
   if (!row) return null;
   return {
