@@ -86,6 +86,11 @@ export class AIConnectorService {
    * Generates text content across providers with transparent fallback execution.
    */
   async generateContent(options: AIConnectorOptions): Promise<string> {
+    const result = await this.generateContentWithMetrics(options);
+    return result.text;
+  }
+
+  async generateContentWithMetrics(options: AIConnectorOptions): Promise<{ text: string, usage: { promptTokens: number, completionTokens: number } }> {
     const errors: Error[] = [];
 
     // Make options mutable so we can normalize MIME type
@@ -128,8 +133,11 @@ export class AIConnectorService {
           this.callProviderGenerate(provider, normalizedOptions)
         );
 
-        if (response) {
-          return response;
+        if (response && (response.text || response.text === '')) {
+          return {
+            text: response.text,
+            usage: response.usage || { promptTokens: 0, completionTokens: 0 }
+          };
         }
       } catch (err: any) {
         console.error(`[AIConnector] Provider ${provider} failed:`, err?.message || err);
@@ -182,7 +190,7 @@ export class AIConnectorService {
     return false;
   }
 
-  private async callProviderGenerate(provider: ProviderType, options: AIConnectorOptions): Promise<string> {
+  private async callProviderGenerate(provider: ProviderType, options: AIConnectorOptions): Promise<{ text: string, usage?: { promptTokens: number, completionTokens: number } }> {
     // 1. GEMINI
     if (provider === 'gemini') {
       let contents: any;
@@ -199,13 +207,18 @@ export class AIConnectorService {
         model: process.env.LLM_MODEL || 'gemini-2.5-flash',
         contents: contents,
       });
-      return result.text ?? '';
+      return {
+        text: result.text ?? '',
+        usage: {
+          promptTokens: result.usageMetadata?.promptTokenCount ?? 0,
+          completionTokens: result.usageMetadata?.candidatesTokenCount ?? 0
+        }
+      };
     }
 
     // 2. OPENAI
     if (provider === 'openai') {
       if (options.mediaBuffer) {
-        // Fallback OpenAI Multimodal input if media provided (GPT-4o supports images natively)
         let mime = options.mimeType || 'image/jpeg';
         const isImage = mime.startsWith('image/');
         
@@ -229,10 +242,14 @@ export class AIConnectorService {
             model: 'gpt-4o',
             messages,
           });
-          return result.choices[0]?.message?.content ?? '';
+          return {
+            text: result.choices[0]?.message?.content ?? '',
+            usage: {
+              promptTokens: result.usage?.prompt_tokens ?? 0,
+              completionTokens: result.usage?.completion_tokens ?? 0
+            }
+          };
         } else {
-          // OpenAI does not support direct audio base64 buffers through Chat Completions without transcription first.
-          // Since we are in a fallback pipeline, we extract as text using Whisper or simulate text-only fallback.
           console.warn("[AIConnector] OpenAI fallback lacks direct inline base64 audio processing. Attempting standard text query.");
         }
       }
@@ -247,7 +264,13 @@ export class AIConnectorService {
         model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
         messages,
       });
-      return result.choices[0]?.message?.content ?? '';
+      return {
+        text: result.choices[0]?.message?.content ?? '',
+        usage: {
+          promptTokens: result.usage?.prompt_tokens ?? 0,
+          completionTokens: result.usage?.completion_tokens ?? 0
+        }
+      };
     }
 
     // 3. OLLAMA
@@ -275,7 +298,13 @@ export class AIConnectorService {
             model: process.env.OLLAMA_MODEL || 'llama3',
             messages,
           });
-          return result.choices[0]?.message?.content ?? '';
+          return {
+            text: result.choices[0]?.message?.content ?? '',
+            usage: {
+              promptTokens: result.usage?.prompt_tokens ?? 0,
+              completionTokens: result.usage?.completion_tokens ?? 0
+            }
+          };
         }
       }
 
@@ -289,10 +318,16 @@ export class AIConnectorService {
         model: process.env.OLLAMA_MODEL || 'llama3',
         messages,
       });
-      return result.choices[0]?.message?.content ?? '';
+      return {
+        text: result.choices[0]?.message?.content ?? '',
+        usage: {
+          promptTokens: result.usage?.prompt_tokens ?? 0,
+          completionTokens: result.usage?.completion_tokens ?? 0
+        }
+      };
     }
 
-    return '';
+    return { text: '' };
   }
 
   private async callProviderEmbed(provider: ProviderType, text: string): Promise<number[]> {

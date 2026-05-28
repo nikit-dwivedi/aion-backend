@@ -17,13 +17,19 @@ async function run() {
   await client.connect();
   
   try {
-    const migrationPath = path.join(__dirname, 'migrations', '001_production_hardening.sql');
-    console.log(`Reading migration from: ${migrationPath}`);
-    const sql = fs.readFileSync(migrationPath, 'utf8');
+    const migrationsDir = path.join(__dirname, 'migrations');
+    console.log(`Reading migrations from: ${migrationsDir}`);
+    const files = fs.readdirSync(migrationsDir)
+      .filter(f => f.endsWith('.sql'))
+      .sort();
     
-    console.log('Running migration...');
-    await client.query(sql);
-    console.log('Migration completed successfully!');
+    for (const file of files) {
+      const filepath = path.join(migrationsDir, file);
+      console.log(`Running migration: ${file}...`);
+      const sqlText = fs.readFileSync(filepath, 'utf8');
+      await client.query(sqlText);
+    }
+    console.log('All migrations completed successfully!');
   } catch (err) {
     console.error('Migration failed:', err);
     process.exit(1);

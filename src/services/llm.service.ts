@@ -10,6 +10,10 @@ class LegacyLLMBridge {
     return await aiConnector.generateContent(options);
   }
 
+  async generateContentWithMetrics(options: AIConnectorOptions): Promise<{ text: string, usage: { promptTokens: number, completionTokens: number } }> {
+    return await aiConnector.generateContentWithMetrics(options);
+  }
+
   async embedContent(text: string): Promise<number[]> {
     return await aiConnector.embedContent(text);
   }

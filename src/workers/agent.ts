@@ -2,9 +2,10 @@ import { db } from '../db/index.js';
 import { events, nodes, edges } from '../db/schema.js';
 import { sql } from 'drizzle-orm';
 import { llm } from '../services/llm.service.js';
-import { env } from '../config/env.js';
-import * as cheerio from 'cheerio';
 import { PgNotifyListener, type NotifyPayload } from '../services/pg_notify_listener.service.js';
+import { SerperProvider } from '../features/research/serper.provider.js';
+import { cleanAndParseJson } from '../core/utils.js';
+
 
 const MAX_RETRIES = 5;
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -96,45 +97,18 @@ async function processResearchById(eventId: string): Promise<void> {
   console.log(`[Agent] Researching: "${query}"`);
 
   try {
-    // Step 1: Scrape DuckDuckGo HTML results
-    const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    const searchResponse = await fetch(searchUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
-    });
+    // Step 1: Query Serper API
+    const searchProvider = new SerperProvider();
+    const searchResults = await searchProvider.search(query);
 
-    if (!searchResponse.ok) {
-      console.error(`[Agent] Search failed for "${query}": ${searchResponse.status}`);
-      await markComplete(eventId, userId, query, 'Search request failed.');
-      return;
-    }
-
-    const html = await searchResponse.text();
-    const $ = cheerio.load(html);
-
-    // Extract search result snippets
-    const snippets: string[] = [];
-    $('.result__snippet').each((_i, el) => {
-      const text = $(el).text().trim();
-      if (text) snippets.push(text);
-    });
-    
-    // Also extract result titles for context
-    const titles: string[] = [];
-    $('.result__a').each((_i, el) => {
-      const text = $(el).text().trim();
-      if (text) titles.push(text);
-    });
-
-    if (snippets.length === 0) {
+    if (searchResults.length === 0) {
       console.log(`[Agent] No results found for "${query}"`);
       await markComplete(eventId, userId, query, 'No search results found for this topic.');
       return;
     }
 
     // Step 2: Build context and summarize with LLM
-    const searchContext = snippets.slice(0, 6).map((s, i) => `[${i + 1}] ${titles[i] || ''}: ${s}`).join('\n');
+    const searchContext = searchResults.slice(0, 6).map((s, i) => `[${i + 1}] ${s.title}: ${s.snippet} (Source: ${s.url})`).join('\n');
 
     const prompt = `You are AION's research agent. The user had a thought: "${payload.sourceSummary}"
 This triggered a research query: "${query}"
@@ -151,66 +125,85 @@ Write as AION speaking to the user. Be specific and factual. Do not use markdown
 
     const summary = await llm.generateContent({ prompt });
 
-    // Step 3: Find original memory node and merge research findings
+    // Step 3: Find original memory node to link research
     let sourceMemoryNodeId: string | null = null;
-    let originalMemoryContent = '';
     
     if (payload.sourceEventId) {
       const sourceMemory = await db.execute(sql`
-        SELECT id, content FROM nodes 
+        SELECT id FROM nodes 
         WHERE metadata->>'originalEventId' = ${payload.sourceEventId}
         AND node_type = 'memory'
         LIMIT 1
       `);
       if (sourceMemory.rows.length > 0) {
         sourceMemoryNodeId = sourceMemory.rows[0]?.id as string;
-        originalMemoryContent = sourceMemory.rows[0]?.content as string;
       }
     }
 
-    if (sourceMemoryNodeId) {
-      // LLM merge and update existing memory node
-      const mergePrompt = `
-        You are AION, a cognitive operating system. Your task is to enrich an existing memory node with new web research findings to keep the memory graph consolidated, clean, and evolving without creating duplicate nodes.
+    // Classify relationship and extract confidence / verification state
+    const classifyPrompt = `
+      Analyze the relationship between this raw thought and the research briefing:
+      Thought: "${payload.sourceSummary}"
+      Research Briefing: "${summary}"
+      
+      Classify the relationship into exactly one of: "enriches", "supports", "contradicts", "expands".
+      Also assess your confidence in this classification (float between 0.0 and 1.0).
+      Provide a short justification of this confidence.
+      Determine the verification state ("verified" or "unverified").
+      
+      Return a JSON object in this format:
+      {
+        "relationType": "enriches" | "supports" | "contradicts" | "expands",
+        "confidenceScore": 0.95,
+        "confidenceSource": "Detailed explanation...",
+        "verificationState": "verified" | "unverified"
+      }
+      Output ONLY raw JSON. No markdown.
+    `;
 
-        Existing Memory Content:
-        "${originalMemoryContent}"
+    const classificationResponse = await llm.generateContent({ prompt: classifyPrompt });
+    const parsedClassification = cleanAndParseJson(classificationResponse);
 
-        New Research Findings:
-        "${summary}"
+    const relationType = parsedClassification.relationType || 'enriches';
+    const confidenceScore = Number(parsedClassification.confidenceScore) || 0.8;
+    const confidenceSource = parsedClassification.confidenceSource || 'General semantic matching';
+    const verificationState = parsedClassification.verificationState || 'unverified';
 
-        Please return a synthesized, consolidated, and comprehensive single memory summary that integrates these research findings into the existing memory naturally. Keep it cohesive and clear.
-        Output ONLY the final merged content text. No conversational filler, no tags, no JSON, no markdown codeblocks. Just the plain text.
-      `;
-      const mergedContent = (await llm.generateContent({ prompt: mergePrompt })).trim();
-      const newEmbedding = await llm.embedContent(mergedContent);
+    const researchEmbedding = await llm.embedContent(summary);
 
-      await db.execute(sql`
-        UPDATE nodes
-        SET content = ${mergedContent},
-            embedding = ${JSON.stringify(newEmbedding)}::vector,
-            updated_at = NOW()
-        WHERE id = ${sourceMemoryNodeId}
-      `);
-      console.log(`[Agent] Enriched and updated original memory node ${sourceMemoryNodeId} with research findings.`);
-    } else {
-      // Fallback: Create new memory node if the original was somehow deleted/not found
-      console.warn(`[Agent] Original memory node not found for source event ${payload.sourceEventId}. Creating fallback research memory node.`);
-      const embeddingVector = await llm.embedContent(summary);
-      await db.insert(nodes).values({
+    await db.transaction(async (tx) => {
+      // 1. Create a distinct research node
+      const [researchNode] = await tx.insert(nodes).values({
         userId,
-        nodeType: 'memory',
-        content: `[Research] ${summary}`,
-        embedding: embeddingVector,
+        nodeType: 'research',
+        content: summary,
+        embedding: researchEmbedding,
         metadata: {
-          type: 'autonomous_research',
           query,
           sourceEventId: payload.sourceEventId,
           sourceSummary: payload.sourceSummary,
-          snippetCount: snippets.length,
-        },
-      });
-    }
+          confidenceScore,
+          confidenceSource,
+          verificationState,
+          sources: searchResults.slice(0, 3)
+        }
+      }).returning();
+
+      if (!researchNode) throw new Error('Failed to create research node');
+
+      // 2. Link research node to memory node using the classified relationship
+      if (sourceMemoryNodeId) {
+        await tx.insert(edges).values({
+          sourceNodeId: researchNode.id,
+          targetNodeId: sourceMemoryNodeId,
+          relationType,
+          weight: confidenceScore
+        });
+        console.log(`[Agent] Created research node linked to original memory ${sourceMemoryNodeId} via relation ${relationType}`);
+      } else {
+        console.warn(`[Agent] Original memory node not found for source event ${payload.sourceEventId}. Research node remains unlinked.`);
+      }
+    });
 
     await markComplete(eventId, userId, query, summary);
     console.log(`[Agent] Research completed for "${query}"`);

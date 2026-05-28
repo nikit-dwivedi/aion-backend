@@ -142,11 +142,17 @@ async function processEventById(eventId: string): Promise<void> {
       - mood_score: An integer from 1 to 10 (1=very negative, 5=neutral, 10=very positive).
       - requires_research: A boolean. true if this thought mentions a topic, concept, or question that could benefit from web research to provide more context or answer the user's curiosity. false otherwise.
       - research_query: If requires_research is true, a short web search query string (max 10 words) to find relevant information. null if false.
+      - priority: One of "low", "normal", "important", "urgent", "critical". "urgent" or "critical" should be reserved for strict deadlines, severe emotional stress, goal conflicts, or direct high-priority planning/task requests.
+      - cognitive_urgency: A float from 0.0 to 1.0 indicating how immediately this thought impacts the user's current goals or mental state (e.g. high urgency if they mention an active crisis, deadline, or immediate emotional shift).
+      - planning_relevance: A float from 0.0 to 1.0 indicating how strongly this thought affects the user's daily plan or schedule (e.g. high relevance for schedule blocks, appointments, new high-level goals).
+      - requires_immediate_attention: A boolean. true if the priority is "urgent" or "critical", or if cognitive_urgency > 0.8, or if the user explicitly demands immediate action. false otherwise.
       Do NOT include a transcription field. Output ONLY raw JSON without markdown formatting.
     `;
 
     let aiResponse: string;
     let transcription: string | null = null;
+    let totalPromptTokens = 0;
+    let totalCompletionTokens = 0;
 
     if ((payload.type === 'audio' || payload.type === 'image') && payload.mediaBase64) {
       // Step 1: Get transcription as plain text (separate call — no JSON formatting risks)
@@ -154,42 +160,62 @@ async function processEventById(eventId: string): Promise<void> {
         ? 'Provide an exact word-for-word transcription of the spoken words in this audio. Output ONLY the transcription text, nothing else.'
         : 'Provide a detailed description of the text and visual elements in this image. Output ONLY the description text, nothing else.';
       try {
-        transcription = (await llm.generateContent({
+        const transcriptResult = await llm.generateContentWithMetrics({
           prompt: transcriptionPrompt,
           mediaBuffer: payload.mediaBase64,
           mimeType: payload.mimeType,
-        })).trim();
+        });
+        transcription = transcriptResult.text.trim();
+        totalPromptTokens += transcriptResult.usage?.promptTokens || 0;
+        totalCompletionTokens += transcriptResult.usage?.completionTokens || 0;
       } catch (e) {
         console.warn('[Extractor] Transcription extraction failed, continuing without:', (e as Error).message);
       }
 
       // Step 2: Get structured metadata (JSON) — transcription is NOT part of this output
-      aiResponse = await llm.generateContent({
+      const metadataResult = await llm.generateContentWithMetrics({
         systemInstruction: payload.type === 'audio' ? 'Listen to this audio thought.' : 'Analyze this image thought.',
         prompt: promptInstruction,
         mediaBuffer: payload.mediaBase64,
         mimeType: payload.mimeType,
       });
+      aiResponse = metadataResult.text;
+      totalPromptTokens += metadataResult.usage?.promptTokens || 0;
+      totalCompletionTokens += metadataResult.usage?.completionTokens || 0;
     } else {
       // For text inputs, the raw content IS the transcription — no LLM call needed
       transcription = payload.content || null;
-      aiResponse = await llm.generateContent({
+      const metadataResult = await llm.generateContentWithMetrics({
         prompt: `Analyze this thought: "${payload.content}"\n${promptInstruction}`
       });
+      aiResponse = metadataResult.text;
+      totalPromptTokens += metadataResult.usage?.promptTokens || 0;
+      totalCompletionTokens += metadataResult.usage?.completionTokens || 0;
     }
     
     const parsed = cleanAndParseJson(aiResponse);
     let finalSummary = parsed.summary;
     let embeddingVector = await llm.embedContent(finalSummary);
 
+    // Prioritization and cost variables
+    const priority = parsed.priority || 'normal';
+    const cognitiveUrgency = Number(parsed.cognitive_urgency) || 0.0;
+    const planningRelevance = Number(parsed.planning_relevance) || 0.0;
+    const requiresImmediateAttention = !!parsed.requires_immediate_attention;
+
+    const estimatedCost = (totalPromptTokens * 0.000075 + totalCompletionTokens * 0.0003) / 1000;
+    const tokenUsage = totalPromptTokens + totalCompletionTokens;
+    const cognitiveComplexity = (parsed.entities?.length || 0) * 0.2 + (parsed.contradictions?.length || 0) * 0.5 + (parsed.action_items?.length || 0) * 0.3;
+    const processingWeight = requiresImmediateAttention ? 2.0 : 1.0;
+
     const initialRawContent = transcription || payload.content || (payload.type === 'audio' ? '[Audio Thought]' : payload.type === 'image' ? '[Image Thought]' : '[Media Thought]');
 
     // Perform Similarity Search to find related past memories (including metadata)
     const similarNodes = await db.execute(sql`
-      SELECT id, content, metadata, 1 - (embedding <=> ${JSON.stringify(embeddingVector)}::vector) as similarity
+      SELECT id, content, metadata, 1 - (embedding <=> ${sql.raw(JSON.stringify(embeddingVector))}::vector) as similarity
       FROM nodes
       WHERE node_type = 'memory' AND user_id = ${userId}
-      ORDER BY embedding <=> ${JSON.stringify(embeddingVector)}::vector
+      ORDER BY embedding <=> ${sql.raw(JSON.stringify(embeddingVector))}::vector
       LIMIT 3
     `);
 
@@ -224,7 +250,8 @@ async function processEventById(eventId: string): Promise<void> {
           Output ONLY the final merged content text. No conversational filler, no tags, no JSON, no markdown codeblocks. Just the plain text.
         `;
 
-        const mergedContent = (await llm.generateContent({ prompt: mergePrompt })).trim();
+        const mergeResult = await llm.generateContentWithMetrics({ prompt: mergePrompt });
+        const mergedContent = mergeResult.text.trim();
         finalSummary = mergedContent;
         // Generate new embedding for the merged content
         embeddingVector = await llm.embedContent(mergedContent);
@@ -239,8 +266,8 @@ async function processEventById(eventId: string): Promise<void> {
         await tx.execute(sql`
           UPDATE nodes
           SET content = ${mergedContent},
-              embedding = ${JSON.stringify(embeddingVector)}::vector,
-              metadata = ${JSON.stringify(existingMeta)}::jsonb,
+              embedding = ${sql.raw(JSON.stringify(embeddingVector))}::vector,
+              metadata = ${sql.raw(JSON.stringify(existingMeta))}::jsonb,
               updated_at = NOW()
           WHERE id = ${memoryNodeId}
         `);
@@ -256,6 +283,10 @@ async function processEventById(eventId: string): Promise<void> {
             sentiment: parsed.sentiment || 'neutral',
             moodScore: parsed.mood_score || 5,
             rawContent: initialRawContent,
+            priority,
+            cognitiveUrgency,
+            planningRelevance,
+            requiresImmediateAttention
           }
         }).returning();
 
@@ -403,7 +434,16 @@ async function processEventById(eventId: string): Promise<void> {
 
       // Mark the event as completed within the transaction
       await tx.execute(sql`
-        UPDATE events SET processing_status = 'completed'
+        UPDATE events SET 
+          processing_status = 'completed',
+          priority = ${priority},
+          cognitive_urgency = ${cognitiveUrgency},
+          planning_relevance = ${planningRelevance},
+          requires_immediate_attention = ${requiresImmediateAttention},
+          estimated_cost = ${estimatedCost},
+          token_usage = ${tokenUsage},
+          processing_weight = ${processingWeight},
+          cognitive_complexity = ${cognitiveComplexity}
         WHERE id = ${eventId}
       `);
 
@@ -422,7 +462,11 @@ async function processEventById(eventId: string): Promise<void> {
       await db.insert(events).values({
         userId,
         eventType: 'research_requested',
-        payload: { query: parsed.research_query, sourceEventId: eventId, sourceSummary: parsed.summary }
+        payload: { query: parsed.research_query, sourceEventId: eventId, sourceSummary: parsed.summary },
+        priority,
+        cognitiveUrgency,
+        planningRelevance,
+        requiresImmediateAttention
       });
       console.log(`[Extractor] Research requested: "${parsed.research_query}"`);
     }
@@ -431,7 +475,11 @@ async function processEventById(eventId: string): Promise<void> {
     await db.insert(events).values({
       userId,
       eventType: 'plan_update_requested',
-      payload: { reason: 'new_thought_processed', newInfo: parsed.summary, sourceEventId: eventId }
+      payload: { reason: 'new_thought_processed', newInfo: parsed.summary, sourceEventId: eventId },
+      priority,
+      cognitiveUrgency,
+      planningRelevance,
+      requiresImmediateAttention
     });
 
   } catch (e: any) {
