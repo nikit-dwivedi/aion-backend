@@ -10,7 +10,7 @@ export class PlanningService {
   static async generateBreakdown(userId: string, goal: string) {
     if (!goal) throw new AppError('Missing goal', 400);
 
-    const allProjects = await PlanningRepository.getActiveProjects();
+    const allProjects = await PlanningRepository.getActiveProjects(userId);
     const projectsText = allProjects.map(p => p.content).join(', ');
 
     const prompt = `
@@ -63,8 +63,8 @@ export class PlanningService {
     }
 
     // 2. No plan for today yet — generate one on-the-fly (fallback)
-    const activeTasks = await PlanningRepository.getActiveTasks();
-    const recentInsights = await PlanningRepository.getRecentInsights();
+    const activeTasks = await PlanningRepository.getActiveTasks(userId);
+    const recentInsights = await PlanningRepository.getRecentInsights(userId);
 
     const actionItems = await db.execute(sql`
       SELECT content FROM nodes

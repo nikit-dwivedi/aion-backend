@@ -6,7 +6,7 @@ import { queueProvider } from '../core/queue.js';
 import { SerperProvider } from '../features/research/serper.provider.js';
 import { cleanAndParseJson } from '../core/utils.js';
 import { embeddingService } from '../services/embedding.service.js';
-import { CognitionLogger } from '../core/observability.ts';
+import { CognitionLogger } from '../core/observability.js';
 import { insertEvent } from '../core/events.js';
 import { isEventReadyForRetry } from './llm_extractor.js';
 

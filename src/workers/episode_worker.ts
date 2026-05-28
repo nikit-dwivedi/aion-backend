@@ -5,7 +5,7 @@ import { queueProvider } from '../core/queue.js';
 import { withAdvisoryLock, LOCK_EPISODIC_CLUSTERING } from '../core/locks.js';
 import { llm } from '../services/llm.service.js';
 import { cleanAndParseJson } from '../core/utils.js';
-import { CognitionLogger } from '../core/observability.ts';
+import { CognitionLogger } from '../core/observability.js';
 
 const MAX_RETRIES = 5;
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));

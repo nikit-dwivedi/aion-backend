@@ -1,0 +1,1 @@
+{"version":3,"file":"serper.provider.d.ts","sourceRoot":"","sources":["../../../src/features/research/serper.provider.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,gBAAgB,EAAE,cAAc,EAAE,MAAM,kCAAkC,CAAC;AAEzF,qBAAa,cAAe,YAAW,gBAAgB;IACrD,OAAO,CAAC,MAAM,CAAS;;IAMjB,MAAM,CAAC,KAAK,EAAE,MAAM,GAAG,OAAO,CAAC,cAAc,EAAE,CAAC;CAiCvD"}

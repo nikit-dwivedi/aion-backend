@@ -12,7 +12,9 @@ export class ProjectsController {
   }
 
   static async moveMemoryToProject(req: Request, res: Response) {
-    const { memoryId, newProjectName, userId = '123e4567-e89b-12d3-a456-426614174000' } = req.body;
+    const userId = req.userId;
+    if (!userId) throw new AppError('Unauthorized', 401);
+    const { memoryId, newProjectName } = req.body;
     await ProjectsService.moveMemoryToProject(memoryId, newProjectName, userId);
     res.json({ success: true });
   }

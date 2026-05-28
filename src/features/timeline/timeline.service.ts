@@ -50,7 +50,7 @@ export class TimelineService {
         };
       }
 
-      const projectName = await TimelineRepository.getProjectForMemory(mem.id);
+      const projectName = await TimelineRepository.getProjectForMemory(mem.id, userId);
       const meta = mem.metadata as any;
       return {
         ...mem,
@@ -68,6 +68,7 @@ export class TimelineService {
     const raw = await TimelineRepository.getResurfacedMemories(userId);
     return raw.map((r: any) => ({
       id: r.id,
+      nodeType: 'memory',
       content: r.content,
       createdAt: r.created_at,
       daysAgo: Math.round((Date.now() - new Date(r.created_at).getTime()) / (1000 * 60 * 60 * 24)),
@@ -80,7 +81,7 @@ export class TimelineService {
     const memory = await TimelineRepository.getMemoryById(userId, memoryId);
     if (!memory) throw new AppError('Memory not found', 404);
 
-    const connections = await TimelineRepository.getMemoryConnections(memoryId);
+    const connections = await TimelineRepository.getMemoryConnections(memoryId, userId);
     const entities = connections.filter(r => r.node_type === 'entity').map(r => r.content);
     const project = connections.find(r => r.node_type === 'project')?.content || null;
     const rawThoughtId = connections.find(r => r.node_type === 'raw_thought')?.id || null;
@@ -90,12 +91,51 @@ export class TimelineService {
       relatedMemories = await TimelineRepository.getSimilarMemories(userId, memoryId, memory.embedding);
     }
 
+    let content = memory.content;
+    let title = undefined;
+    let insightType = undefined;
+    let recommendation = undefined;
+    let strength = undefined;
+    let relatedEntityOrProject = null;
+
+    if (memory.nodeType === 'insight') {
+      title = 'Cognitive Insight';
+      insightType = 'behavioral';
+      strength = 1.0;
+      recommendation = '';
+
+      try {
+        const parsed = JSON.parse(memory.content);
+        if (parsed && typeof parsed === 'object') {
+          title = parsed.title || title;
+          content = parsed.body || parsed.content || content;
+          insightType = parsed.type || parsed.insightType || insightType;
+          recommendation = parsed.recommendation || recommendation;
+          strength = parsed.strength !== undefined ? Number(parsed.strength) : strength;
+          relatedEntityOrProject = parsed.relatedEntityOrProject || relatedEntityOrProject;
+        }
+      } catch (e) {
+        const meta = memory.metadata as any;
+        title = meta?.title || title;
+        recommendation = meta?.recommendation || recommendation;
+        insightType = meta?.type || insightType;
+        strength = meta?.strength || strength;
+        relatedEntityOrProject = meta?.relatedEntityOrProject || null;
+      }
+    }
+
     const meta = memory.metadata as any;
     return {
       memory: {
         id: memory.id,
-        content: memory.content,
-        rawContent: meta?.rawContent || memory.content,
+        nodeType: memory.nodeType,
+        content,
+        title,
+        insightType,
+        recommendation,
+        strength,
+        relatedEntityOrProject,
+        rawContent: meta?.rawContent || content,
         sentiment: meta?.sentiment || 'neutral',
         moodScore: meta?.moodScore || 5,
         rawThoughtId,
@@ -107,8 +147,8 @@ export class TimelineService {
     };
   }
 
-  static async deleteMemory(memoryId: string) {
+  static async deleteMemory(memoryId: string, userId: string) {
     if (!memoryId) throw new AppError('Missing memory id', 400);
-    await TimelineRepository.deleteMemory(memoryId);
+    await TimelineRepository.deleteMemory(memoryId, userId);
   }
 }

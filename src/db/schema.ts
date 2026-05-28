@@ -96,3 +96,24 @@ export const retrievalLogs = pgTable('retrieval_logs', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
+// The Loops Table (Recurring Mental Loops)
+export const loops = pgTable('loops', {
+  id: uuid('id').defaultRandom().primaryKey(),
+  userId: uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  title: text('title').notNull(),
+  summary: text('summary').notNull(),
+  primaryEmotion: text('primary_emotion').default('neutral').notNull(), // 'anxiety' | 'fear' | 'sadness' | 'stress' | 'frustration' | 'guilt' | 'hope' | 'neutral'
+  loopCategory: text('loop_category').default('other').notNull(), // 'career' | 'finance' | 'relationships' | 'burnout' | 'self-worth' | 'health' | 'identity' | 'uncertainty' | 'other'
+  avoidanceScore: doublePrecision('avoidance_score').default(0.0).notNull(),
+  resolutionConfidence: doublePrecision('resolution_confidence').default(0.0).notNull(),
+  triggerPatterns: jsonb('trigger_patterns').default('[]').notNull(),
+  repetitionCount: integer('repetition_count').default(1).notNull(),
+  relatedMemoryIds: jsonb('related_memory_ids').default('[]').notNull(),
+  firstSeenAt: timestamp('first_seen_at').defaultNow().notNull(),
+  lastSeenAt: timestamp('last_seen_at').defaultNow().notNull(),
+  status: text('status').default('emerging').notNull(), // emerging, active, persistent, critical, dormant, resolved, relapsing, archived
+  snoozedUntil: timestamp('snoozed_until'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+

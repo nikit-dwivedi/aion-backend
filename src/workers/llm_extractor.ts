@@ -7,8 +7,9 @@ import { incrementUsage } from '../core/middlewares/quota.middleware.js';
 import { queueProvider } from '../core/queue.js';
 import { cleanAndParseJson } from '../core/utils.js';
 import { embeddingService } from '../services/embedding.service.js';
-import { CognitionLogger } from '../core/observability.ts';
+import { CognitionLogger } from '../core/observability.js';
 import { insertEvent } from '../core/events.js';
+import { LoopDetectionService } from '../services/loop_detection.service.js';
 
 const MAX_RETRIES = 5;
 
@@ -404,6 +405,11 @@ console.log("Embedding dimension:", embeddingVector.length);
 
     console.log(`[Extractor] Successfully processed event ${eventId}`);
     await incrementUsage(userId);
+
+    // Trigger loop detection asynchronously in background
+    LoopDetectionService.detectLoops(userId).catch(err => {
+      console.error('[Extractor] Loop detection background task failed:', err);
+    });
 
     // Enqueue research event
     if (parsed.requires_research && parsed.research_query) {

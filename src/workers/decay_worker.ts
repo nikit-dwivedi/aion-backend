@@ -4,7 +4,7 @@ import { sql, eq } from 'drizzle-orm';
 import { queueProvider } from '../core/queue.js';
 import { withAdvisoryLock, LOCK_GRAPH_MUTATION } from '../core/locks.js';
 import { CognitionService } from '../services/cognition.service.js';
-import { CognitionLogger } from '../core/observability.ts';
+import { CognitionLogger } from '../core/observability.js';
 
 const MAX_RETRIES = 5;
 

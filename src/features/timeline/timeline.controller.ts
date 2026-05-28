@@ -30,8 +30,10 @@ export class TimelineController {
   }
 
   static async deleteMemory(req: Request, res: Response) {
+    const userId = req.userId;
+    if (!userId) throw new AppError('Unauthorized', 401);
     const memoryId = req.params.id as string;
-    await TimelineService.deleteMemory(memoryId);
+    await TimelineService.deleteMemory(memoryId, userId);
     res.json({ success: true });
   }
 }

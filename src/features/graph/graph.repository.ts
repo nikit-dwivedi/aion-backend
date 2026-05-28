@@ -23,14 +23,18 @@ export class GraphRepository {
       .where(eq(nodes.userId, userId));
   }
 
-  static async getEdges(nodeIds: string[]) {
+  static async getEdges(nodeIds: string[], userId: string) {
     if (nodeIds.length === 0) return [];
     
     const edgeResult = await db.execute(sql`
       SELECT e.id, e.source_node_id, e.target_node_id, e.relation_type, e.weight
       FROM edges e
+      JOIN nodes s ON e.source_node_id = s.id
+      JOIN nodes t ON e.target_node_id = t.id
       WHERE (e.source_node_id = ANY(ARRAY[${sql.join(nodeIds, sql`, `)}]::uuid[])
         OR e.target_node_id = ANY(ARRAY[${sql.join(nodeIds, sql`, `)}]::uuid[]))
+      AND s.user_id = ${userId}
+      AND t.user_id = ${userId}
       ORDER BY e.weight DESC
     `);
     return edgeResult.rows;
@@ -47,7 +51,7 @@ export class GraphRepository {
    * 
    * Returns all reachable nodes within 2 hops and their connecting edges.
    */
-  static async getNeighborhood(seedNodeId: string, maxDepth = 2, maxEdgesPerNode = 50) {
+  static async getNeighborhood(seedNodeId: string, userId: string, maxDepth = 2, maxEdgesPerNode = 50) {
     const result = await db.execute(sql`
       WITH RECURSIVE graph_walk AS (
         -- Base case: start from the seed node
@@ -61,6 +65,7 @@ export class GraphRepository {
           ARRAY[n.id] AS path
         FROM nodes n
         WHERE n.id = ${seedNodeId}
+        AND n.user_id = ${userId}
 
         UNION ALL
 
@@ -88,6 +93,7 @@ export class GraphRepository {
           ELSE ranked_edges.source_node_id
         END
         WHERE gw.depth < ${maxDepth}
+          AND neighbor.user_id = ${userId}
           AND NOT (neighbor.id = ANY(gw.path))  -- Loop detection
       )
       SELECT DISTINCT ON (node_id) node_id, node_type, content, metadata, created_at, depth
@@ -102,7 +108,7 @@ export class GraphRepository {
    * Get edges between a set of nodes, with supernode protection.
    * Limits to top 15 edges per source node by weight.
    */
-  static async getEdgesBounded(nodeIds: string[], maxEdgesPerSource = 15) {
+  static async getEdgesBounded(nodeIds: string[], userId: string, maxEdgesPerSource = 15) {
     if (nodeIds.length === 0) return [];
 
     const result = await db.execute(sql`
@@ -112,8 +118,12 @@ export class GraphRepository {
           e.id, e.source_node_id, e.target_node_id, e.relation_type, e.weight,
           ROW_NUMBER() OVER (PARTITION BY e.source_node_id ORDER BY e.weight DESC) as rn
         FROM edges e
-        WHERE e.source_node_id = ANY(ARRAY[${sql.join(nodeIds, sql`, `)}]::uuid[])
-          OR e.target_node_id = ANY(ARRAY[${sql.join(nodeIds, sql`, `)}]::uuid[])
+        JOIN nodes s ON e.source_node_id = s.id
+        JOIN nodes t ON e.target_node_id = t.id
+        WHERE (e.source_node_id = ANY(ARRAY[${sql.join(nodeIds, sql`, `)}]::uuid[])
+          OR e.target_node_id = ANY(ARRAY[${sql.join(nodeIds, sql`, `)}]::uuid[]))
+        AND s.user_id = ${userId}
+        AND t.user_id = ${userId}
       ) ranked
       WHERE rn <= ${maxEdgesPerSource}
     `);

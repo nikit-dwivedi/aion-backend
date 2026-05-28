@@ -20,6 +20,13 @@ export const errorHandler = (err: Error, req: Request, res: Response, next: Next
     });
   }
 
+  if (err.name === 'MulterError') {
+    return res.status(400).json({
+      status: 'error',
+      message: err.message,
+    });
+  }
+
   console.error('🔥 UNEXPECTED ERROR:', err);
 
   return res.status(500).json({

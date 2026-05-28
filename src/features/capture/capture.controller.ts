@@ -11,7 +11,7 @@ export class CaptureController {
     if (!userId) throw new AppError('Unauthorized', 401);
 
     const event = await CaptureService.captureMedia(userId, type, content, mediaFile);
-    res.status(201).json({ message: 'Event logged successfully', event });
+    res.status(201).json({ message: "Got it. You don't need to hold this in your head anymore.", event });
   }
 
   static async capturePdf(req: Request, res: Response) {
@@ -22,7 +22,7 @@ export class CaptureController {
     if (!file) throw new AppError('Missing document file', 400);
 
     const result = await CaptureService.capturePdf(userId, file);
-    res.status(201).json({ message: 'PDF processed successfully', ...result });
+    res.status(201).json({ message: "Got it. You don't need to hold this in your head anymore.", ...result });
   }
 
   static async captureUrl(req: Request, res: Response) {
@@ -32,6 +32,6 @@ export class CaptureController {
     if (!userId) throw new AppError('Unauthorized', 401);
 
     const result = await CaptureService.captureUrl(userId, url);
-    res.status(201).json({ message: 'URL captured successfully', ...result });
+    res.status(201).json({ message: "Got it. You don't need to hold this in your head anymore.", ...result });
   }
 }

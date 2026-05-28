@@ -6,7 +6,7 @@ import { queueProvider } from '../core/queue.js';
 import { cleanAndParseJson, normalizeAllUserTimezones } from '../core/utils.js';
 import { withAdvisoryLock, LOCK_PLAN_ORCHESTRATION } from '../core/locks.js';
 import { insertEvent } from '../core/events.js';
-import { CognitionLogger } from '../core/observability.ts';
+import { CognitionLogger } from '../core/observability.js';
 import { isEventReadyForRetry } from './llm_extractor.js';
 
 const MAX_RETRIES = 5;

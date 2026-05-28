@@ -5,19 +5,19 @@ import { AppError } from '../../core/middlewares/error.middleware.js';
 import { embeddingService } from '../../services/embedding.service.js';
 
 export class SearchService {
-  static async searchMemories(query: string) {
+  static async searchMemories(userId: string, query: string) {
     if (!query) throw new AppError('Missing query', 400);
     if (!llm.isConfigured) throw new AppError('LLM service is not configured.', 500);
 
     const queryEmbedding = await embeddingService.generateEmbedding(query);
-    const similarNodes = await SearchRepository.findSimilarMemories(queryEmbedding, 5);
+    const similarNodes = await SearchRepository.findSimilarMemories(queryEmbedding, userId, 5);
 
     if (similarNodes.length === 0) {
       return { answer: "I couldn't find any relevant memories for that.", context: [] };
     }
 
     const memoryNodeIds = similarNodes.map(n => n.id);
-    const connectedNodesQuery = await SearchRepository.getMemoryConnections(memoryNodeIds);
+    const connectedNodesQuery = await SearchRepository.getMemoryConnections(memoryNodeIds, userId);
 
     const connectionsByMemory: Record<string, string[]> = {};
     for (const row of connectedNodesQuery.rows) {

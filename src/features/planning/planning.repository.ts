@@ -1,12 +1,12 @@
 import { db } from '../../db/index.js';
 import { nodes, edges } from '../../db/schema.js';
-import { eq, desc, sql } from 'drizzle-orm';
+import { eq, and, desc, sql } from 'drizzle-orm';
 
 export class PlanningRepository {
   static async resolveNode(userId: string, nodeType: string, content: string, tx: any = db) {
     const existing = await tx.execute(sql`
       SELECT id FROM nodes 
-      WHERE node_type = ${nodeType} AND lower(content) = lower(${content})
+      WHERE node_type = ${nodeType} AND user_id = ${userId} AND lower(content) = lower(${content})
       LIMIT 1
     `);
     
@@ -23,8 +23,8 @@ export class PlanningRepository {
     return newNode.id;
   }
 
-  static async getActiveProjects() {
-    return await db.select({ content: nodes.content }).from(nodes).where(eq(nodes.nodeType, 'project'));
+  static async getActiveProjects(userId: string) {
+    return await db.select({ content: nodes.content }).from(nodes).where(and(eq(nodes.nodeType, 'project'), eq(nodes.userId, userId)));
   }
 
   static async saveGoalBreakdown(userId: string, breakdown: any) {
@@ -76,22 +76,24 @@ export class PlanningRepository {
     });
   }
 
-  static async getActiveTasks() {
+  static async getActiveTasks(userId: string) {
     return await db.execute(sql`
       SELECT t.content as task, g.content as goal
       FROM nodes t
       JOIN edges e ON e.source_node_id = t.id
       JOIN nodes g ON e.target_node_id = g.id
       WHERE t.node_type = 'task' AND g.node_type = 'goal'
+      AND t.user_id = ${userId}
+      AND g.user_id = ${userId}
       LIMIT 10
     `);
   }
 
-  static async getRecentInsights() {
+  static async getRecentInsights(userId: string) {
     return await db
       .select({ content: nodes.content })
       .from(nodes)
-      .where(eq(nodes.nodeType, 'insight'))
+      .where(and(eq(nodes.nodeType, 'insight'), eq(nodes.userId, userId)))
       .orderBy(desc(nodes.createdAt))
       .limit(5);
   }

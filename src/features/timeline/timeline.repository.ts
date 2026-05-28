@@ -20,13 +20,16 @@ export class TimelineRepository {
     return memories;
   }
 
-  static async getProjectForMemory(memoryId: string) {
+  static async getProjectForMemory(memoryId: string, userId: string) {
     const projectEdge = await db.execute(sql`
       SELECT n.content as project_name
       FROM edges e
       JOIN nodes n ON e.target_node_id = n.id
+      JOIN nodes s ON e.source_node_id = s.id
       WHERE e.source_node_id = ${memoryId}
       AND n.node_type = 'project'
+      AND s.user_id = ${userId}
+      AND n.user_id = ${userId}
       LIMIT 1
     `);
     return (projectEdge.rows[0] as any)?.project_name || null;
@@ -51,17 +54,20 @@ export class TimelineRepository {
     const [memory] = await db
       .select()
       .from(nodes)
-      .where(and(eq(nodes.id, memoryId), eq(nodes.nodeType, 'memory'), eq(nodes.userId, userId)))
+      .where(and(eq(nodes.id, memoryId), eq(nodes.userId, userId)))
       .limit(1);
     return memory;
   }
 
-  static async getMemoryConnections(memoryId: string) {
+  static async getMemoryConnections(memoryId: string, userId: string) {
     const connections = await db.execute(sql`
       SELECT n.id, n.node_type, n.content, e.relation_type
       FROM edges e
       JOIN nodes n ON e.target_node_id = n.id
+      JOIN nodes s ON e.source_node_id = s.id
       WHERE e.source_node_id = ${memoryId}
+      AND s.user_id = ${userId}
+      AND n.user_id = ${userId}
     `);
     return connections.rows;
   }
@@ -82,7 +88,7 @@ export class TimelineRepository {
     return similar.filter(s => s.id !== memoryId).slice(0, 3);
   }
 
-  static async deleteMemory(memoryId: string) {
-    await db.delete(nodes).where(eq(nodes.id, memoryId));
+  static async deleteMemory(memoryId: string, userId: string) {
+    await db.delete(nodes).where(and(eq(nodes.id, memoryId), eq(nodes.userId, userId)));
   }
 }

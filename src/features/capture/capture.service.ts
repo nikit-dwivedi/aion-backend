@@ -3,6 +3,71 @@ const pdfParse = (pdfParseModule as any).default || pdfParseModule;
 import * as cheerio from 'cheerio';
 import { CaptureRepository } from './capture.repository.js';
 import { AppError } from '../../core/middlewares/error.middleware.js';
+import dns from 'dns';
+import { promisify } from 'util';
+
+const dnsLookup = promisify(dns.lookup);
+
+function isPrivateIp(ip: string): boolean {
+  if (ip === 'localhost' || ip === '127.0.0.1' || ip === '::1') return true;
+
+  // Check IPv4 ranges
+  const ipv4Parts = ip.split('.');
+  if (ipv4Parts.length === 4) {
+    const first = parseInt(ipv4Parts[0]!, 10);
+    const second = parseInt(ipv4Parts[1]!, 10);
+
+    // 10.0.0.0/8
+    if (first === 10) return true;
+    // 172.16.0.0/12
+    if (first === 172 && (second >= 16 && second <= 31)) return true;
+    // 192.168.0.0/16
+    if (first === 192 && second === 168) return true;
+    // 169.254.0.0/16 (Link Local)
+    if (first === 169 && second === 254) return true;
+    // 0.0.0.0/8
+    if (first === 0) return true;
+  }
+
+  // Check IPv6 ranges
+  if (ip.includes(':')) {
+    const lowerIp = ip.toLowerCase();
+    if (lowerIp === '::' || lowerIp === '::1') return true;
+    if (lowerIp.startsWith('fe80:')) return true;
+    if (lowerIp.startsWith('fc00:') || lowerIp.startsWith('fd00:')) return true;
+  }
+
+  return false;
+}
+
+export async function validateUrlForSsrf(urlStr: string): Promise<string> {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(urlStr);
+  } catch (e) {
+    throw new AppError('Invalid URL format', 400);
+  }
+
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    throw new AppError('Protocol must be http or https', 400);
+  }
+
+  const hostname = parsedUrl.hostname;
+  if (!hostname) {
+    throw new AppError('Invalid URL hostname', 400);
+  }
+
+  try {
+    const { address } = await dnsLookup(hostname);
+    if (isPrivateIp(address)) {
+      throw new AppError('Access to private/local network address is blocked', 400);
+    }
+    return parsedUrl.toString();
+  } catch (err: any) {
+    if (err instanceof AppError) throw err;
+    throw new AppError(`Failed to resolve host: ${hostname}`, 400);
+  }
+}
 
 export class CaptureService {
   static async captureMedia(userId: string, type: string, content?: string, mediaFile?: Express.Multer.File) {
@@ -50,7 +115,9 @@ export class CaptureService {
   static async captureUrl(userId: string, url: string) {
     if (!url) throw new AppError('Missing url', 400);
 
-    const response = await fetch(url, { 
+    const validatedUrl = await validateUrlForSsrf(url);
+
+    const response = await fetch(validatedUrl, { 
       headers: { 'User-Agent': 'AION-Cognitive-OS/1.0' },
       signal: AbortSignal.timeout(10000),
     });

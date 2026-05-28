@@ -6,8 +6,8 @@ export class ProjectsService {
     const projects = await ProjectsRepository.getProjects(userId);
 
     const enriched = await Promise.all(projects.map(async (proj) => {
-      const linkedMemories = await ProjectsRepository.getLinkedMemories(proj.id);
-      const linkedEntities = await ProjectsRepository.getLinkedEntities(proj.id);
+      const linkedMemories = await ProjectsRepository.getLinkedMemories(proj.id, userId);
+      const linkedEntities = await ProjectsRepository.getLinkedEntities(proj.id, userId);
 
       return {
         ...proj,

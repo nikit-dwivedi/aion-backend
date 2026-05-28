@@ -4,7 +4,7 @@ export class GraphService {
   static async getGraph(userId: string) {
     const allNodes = await GraphRepository.getNodes(userId);
     const nodeIds = allNodes.map(n => n.id);
-    const allEdges = await GraphRepository.getEdges(nodeIds);
+    const allEdges = await GraphRepository.getEdges(nodeIds, userId);
 
     const now = Date.now();
     const graphNodes = allNodes.map(n => {

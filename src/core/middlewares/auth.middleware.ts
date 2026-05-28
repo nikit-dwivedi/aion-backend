@@ -27,14 +27,7 @@ export const authMiddleware = (req: Request, res: Response, next: NextFunction) 
   try {
     const payload = jwt.verify(token, env.JWT_SECRET) as { userId: string };
     req.userId = payload.userId;
-    
-    // Bind session context for Row-Level Security (RLS)
-    db.execute(sql`SELECT set_config('app.current_user_id', ${payload.userId}, false)`)
-      .then(() => next())
-      .catch((err) => {
-        console.error('[AuthMiddleware] RLS session binding failed:', err);
-        next(err);
-      });
+    next();
   } catch (error) {
     return next(new AppError('Invalid or expired token', 401));
   }
