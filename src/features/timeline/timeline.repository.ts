@@ -51,12 +51,12 @@ export class TimelineRepository {
   }
 
   static async getMemoryById(userId: string, memoryId: string) {
-    const [memory] = await db
+    const mems = await db
       .select()
       .from(nodes)
-      .where(and(eq(nodes.id, memoryId), eq(nodes.userId, userId)))
+      .where(and(eq(nodes.id, memoryId), eq(nodes.userId, userId), inArray(nodes.nodeType, ['memory', 'insight', 'raw_thought'])))
       .limit(1);
-    return memory;
+    return mems[0] || null;
   }
 
   static async getMemoryConnections(memoryId: string, userId: string) {

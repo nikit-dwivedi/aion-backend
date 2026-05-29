@@ -22,7 +22,8 @@ export class AuthService {
     if (!user) throw new AppError('Failed to create user', 500);
 
     const token = jwt.sign({ userId: user.id }, env.JWT_SECRET, { expiresIn: '30d' });
-    return { token, userId: user.id };
+    const { passwordHash: _, ...userWithoutPassword } = user;
+    return { token, user: userWithoutPassword };
   }
 
   static async login(email: string, password: string, timezone?: string) {
@@ -44,7 +45,8 @@ export class AuthService {
     }
 
     const token = jwt.sign({ userId: user.id }, env.JWT_SECRET, { expiresIn: '30d' });
-    return { token, userId: user.id };
+    const { passwordHash: _, ...userWithoutPassword } = user;
+    return { token, user: userWithoutPassword };
   }
 
   static async getProfile(userId: string) {

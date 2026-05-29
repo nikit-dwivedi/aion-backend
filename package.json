@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "tsx --test src/tests/aion.test.ts",
-    "dev": "tsx watch src/index.ts",
+    "dev": "concurrently \"npm run dev:api\" \"npm run dev:worker\" \"npm run dev:scheduler\"",
     "dev:api": "tsx watch src/index.ts",
     "dev:worker": "tsx watch src/worker.ts",
     "dev:scheduler": "tsx watch src/scheduler.ts",
@@ -43,6 +43,7 @@
     "@types/multer": "^2.1.0",
     "@types/node": "^25.8.0",
     "@types/pg": "^8.20.0",
+    "concurrently": "^9.2.1",
     "drizzle-kit": "^0.31.10",
     "tsx": "^4.22.1",
     "typescript": "^6.0.3"
