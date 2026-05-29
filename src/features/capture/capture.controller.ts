@@ -34,4 +34,14 @@ export class CaptureController {
     const result = await CaptureService.captureUrl(userId, url);
     res.status(201).json({ message: "Got it. You don't need to hold this in your head anymore.", ...result });
   }
+  static async retryCapture(req: Request, res: Response) {
+    const userId = req.userId;
+    const { id } = req.params;
+
+    if (!userId) throw new AppError('Unauthorized', 401);
+    if (!id || typeof id !== 'string') throw new AppError('Missing event ID', 400);
+
+    const result = await CaptureService.retryCapture(userId, id);
+    res.status(200).json({ message: "Retry queued.", event: result });
+  }
 }

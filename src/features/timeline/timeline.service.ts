@@ -79,7 +79,7 @@ export class TimelineService {
         id: evt.id,
         nodeType: 'memory',
         content,
-        metadata: { status: evt.processing_status },
+        metadata: { status: evt.processing_status, progress: payload?.progress },
         createdAt: evt.created_at,
         updatedAt: evt.created_at,
         project: null,

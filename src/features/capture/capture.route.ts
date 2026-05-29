@@ -33,5 +33,6 @@ router.use(checkQuota('capture'));
 router.post('/', upload.single('media'), asyncHandler(CaptureController.captureMedia));
 router.post('/pdf', upload.single('document'), asyncHandler(CaptureController.capturePdf));
 router.post('/url', asyncHandler(CaptureController.captureUrl));
+router.post('/retry/:id', asyncHandler(CaptureController.retryCapture));
 
 export default router;

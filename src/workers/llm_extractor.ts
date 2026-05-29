@@ -71,6 +71,14 @@ async function sweepPendingEvents(): Promise<void> {
   }
 }
 
+async function updateProgress(eventId: string, progress: string) {
+  await db.execute(sql`
+    UPDATE events 
+    SET payload = payload || jsonb_build_object('progress', ${progress}::text)
+    WHERE id = ${eventId}
+  `);
+}
+
 async function processEventById(eventId: string): Promise<void> {
   const startTime = Date.now();
   
@@ -105,6 +113,7 @@ async function processEventById(eventId: string): Promise<void> {
   console.log(`[Extractor] Processing event ${eventId} (Priority: ${eventRow.priority})`);
 
   try {
+    await updateProgress(eventId, 'Extracting Context...');
     const recentMems = await db.execute(sql`
       SELECT content FROM nodes 
       WHERE node_type = 'memory' AND user_id = ${userId}
@@ -189,6 +198,7 @@ async function processEventById(eventId: string): Promise<void> {
     const parsed = cleanAndParseJson(aiResponse);
     let finalSummary = parsed.summary;
     
+    await updateProgress(eventId, 'Generating Neural Embeddings...');
     // Decoupled embedding service call
     let embeddingVector = await embeddingService.generateEmbedding(finalSummary);
 
@@ -204,6 +214,7 @@ async function processEventById(eventId: string): Promise<void> {
 
     const initialRawContent = transcription || payload.content || '[Media Thought]';
 
+    await updateProgress(eventId, 'Finding Related Memories...');
     // Cosine similarity search using cosine distance operator <=>
     const vectorString = `[${embeddingVector.join(",")}]`;
 console.log("Embedding dimension:", embeddingVector.length);
@@ -218,6 +229,7 @@ console.log("Embedding dimension:", embeddingVector.length);
       LIMIT 3
     `);
 
+    await updateProgress(eventId, 'Finalizing Memory Graph...');
     await db.transaction(async (tx) => {
       // Create raw thought node
       const [rawThoughtNode] = await tx.insert(nodes).values({

@@ -150,4 +150,8 @@ export class CaptureService {
     const event = await CaptureRepository.insertMemoryEvent(userId, payload);
     return { event, stats: { title, characters: content.length } };
   }
+
+  static async retryCapture(userId: string, eventId: string) {
+    return await CaptureRepository.retryEvent(userId, eventId);
+  }
 }

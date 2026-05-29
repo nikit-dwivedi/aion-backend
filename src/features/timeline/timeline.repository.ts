@@ -26,7 +26,7 @@ export class TimelineRepository {
       SELECT id, event_type, payload, processing_status, created_at
       FROM events
       WHERE user_id = ${userId}
-      AND processing_status IN ('pending', 'processing', 'retrying')
+      AND processing_status IN ('pending', 'processing', 'retrying', 'failed', 'dead_lettered')
       AND event_type IN ('memory_created', 'text', 'audio', 'image', 'url', 'pdf')
       ORDER BY created_at DESC
       LIMIT ${limit}
