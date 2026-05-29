@@ -255,6 +255,11 @@ console.log("Embedding dimension:", embeddingVector.length);
         if (!existingMeta.rawContent) {
           existingMeta.rawContent = topMatch.content;
         }
+        if (payload.mediaBase64) {
+          existingMeta.mediaBase64 = payload.mediaBase64;
+          existingMeta.mimeType = payload.mimeType;
+          existingMeta.type = payload.type;
+        }
         const vectorString = `[${embeddingVector.join(",")}]`;
         const metadataString = JSON.stringify(existingMeta);
 
@@ -281,7 +286,10 @@ console.log("Embedding dimension:", embeddingVector.length);
             priority,
             cognitiveUrgency,
             planningRelevance,
-            requiresImmediateAttention
+            requiresImmediateAttention,
+            type: payload.type,
+            mimeType: payload.mimeType,
+            mediaBase64: payload.mediaBase64
           }
         }).returning();
 

@@ -58,10 +58,42 @@ export class TimelineService {
         rawContent: meta?.rawContent || null,
         sentiment: meta?.sentiment || 'neutral',
         moodScore: meta?.moodScore || 5,
+        type: meta?.type,
+        mediaBase64: meta?.mediaBase64,
+        mimeType: meta?.mimeType
       };
     }));
 
-    return enriched;
+    const pendingEvents = await TimelineRepository.getPendingMemories(userId, 10);
+    const pendingMemories = pendingEvents.map((evt: any) => {
+      let content = 'Processing...';
+      const payload = evt.payload;
+      if (payload) {
+        if (payload.type === 'text') content = payload.content;
+        else if (payload.type === 'audio') content = 'Audio Note (Processing...)';
+        else if (payload.type === 'image') content = 'Image (Processing...)';
+        else if (payload.type === 'url') content = `Link: ${payload.sourceUrl || ''}`;
+        else if (payload.type === 'pdf') content = `Document: ${payload.originalFilename || ''}`;
+      }
+      return {
+        id: evt.id,
+        nodeType: 'memory',
+        content,
+        metadata: { status: evt.processing_status },
+        createdAt: evt.created_at,
+        updatedAt: evt.created_at,
+        project: null,
+        rawContent: null,
+        sentiment: 'neutral',
+        moodScore: 5,
+      };
+    });
+
+    const timeline = [...pendingMemories, ...enriched].sort((a, b) => 
+      new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime()
+    );
+
+    return timeline;
   }
 
   static async getResurfaced(userId: string) {
