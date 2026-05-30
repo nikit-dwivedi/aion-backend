@@ -1,9 +1,15 @@
 import { db } from '../../db/index.js';
 import { nodes, edges } from '../../db/schema.js';
-import { eq, and, desc, sql, cosineDistance, inArray } from 'drizzle-orm';
+import { eq, and, desc, sql, cosineDistance, inArray, lt } from 'drizzle-orm';
 
 export class TimelineRepository {
-  static async getRecentMemories(userId: string, limit = 50) {
+  static async getRecentMemories(userId: string, limit = 50, cursor?: string | null) {
+    let whereClause = and(inArray(nodes.nodeType, ['memory', 'insight']), eq(nodes.userId, userId));
+    
+    if (cursor) {
+      whereClause = and(whereClause, lt(nodes.updatedAt, new Date(cursor)));
+    }
+
     const memories = await db
       .select({
         id: nodes.id,
@@ -14,7 +20,7 @@ export class TimelineRepository {
         updatedAt: nodes.updatedAt,
       })
       .from(nodes)
-      .where(and(inArray(nodes.nodeType, ['memory', 'insight']), eq(nodes.userId, userId)))
+      .where(whereClause)
       .orderBy(desc(nodes.updatedAt))
       .limit(limit);
 

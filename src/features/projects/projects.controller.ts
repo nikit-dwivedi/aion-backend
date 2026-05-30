@@ -7,7 +7,10 @@ export class ProjectsController {
     const userId = req.userId;
     if (!userId) throw new AppError('Unauthorized', 401);
 
-    const projects = await ProjectsService.getProjects(userId);
+    const cursor = req.query.cursor as string | undefined;
+    const limit = req.query.limit ? parseInt(req.query.limit as string) : 50;
+
+    const projects = await ProjectsService.getProjects(userId, limit, cursor);
     res.json({ projects });
   }
 

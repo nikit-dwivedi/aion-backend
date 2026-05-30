@@ -7,7 +7,10 @@ export class TimelineController {
     const userId = req.userId;
     if (!userId) throw new AppError('Unauthorized', 401);
 
-    const memories = await TimelineService.getTimeline(userId);
+    const cursor = req.query.cursor as string | undefined;
+    const limit = req.query.limit ? parseInt(req.query.limit as string) : 50;
+
+    const memories = await TimelineService.getTimeline(userId, limit, cursor);
     
     res.json({ memories });
   }

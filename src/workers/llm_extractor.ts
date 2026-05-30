@@ -299,9 +299,9 @@ console.log("Embedding dimension:", embeddingVector.length);
             cognitiveUrgency,
             planningRelevance,
             requiresImmediateAttention,
-            type: payload.type,
+            mediaBase64: payload.mediaBase64,
             mimeType: payload.mimeType,
-            mediaBase64: payload.mediaBase64
+            type: payload.type
           }
         }).returning();
 

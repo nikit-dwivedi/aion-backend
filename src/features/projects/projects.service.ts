@@ -2,8 +2,8 @@ import { ProjectsRepository } from './projects.repository.js';
 import { AppError } from '../../core/middlewares/error.middleware.js';
 
 export class ProjectsService {
-  static async getProjects(userId: string) {
-    const projects = await ProjectsRepository.getProjects(userId);
+  static async getProjects(userId: string, limit = 50, cursor?: string | null) {
+    const projects = await ProjectsRepository.getProjects(userId, limit, cursor);
 
     const enriched = await Promise.all(projects.map(async (proj) => {
       const linkedMemories = await ProjectsRepository.getLinkedMemories(proj.id, userId);

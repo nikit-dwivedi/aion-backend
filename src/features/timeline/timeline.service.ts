@@ -2,8 +2,8 @@ import { TimelineRepository } from './timeline.repository.js';
 import { AppError } from '../../core/middlewares/error.middleware.js';
 
 export class TimelineService {
-  static async getTimeline(userId: string) {
-    const memories = await TimelineRepository.getRecentMemories(userId, 50);
+  static async getTimeline(userId: string, limit = 50, cursor?: string | null) {
+    const memories = await TimelineRepository.getRecentMemories(userId, limit, cursor);
 
     const enriched = await Promise.all(memories.map(async (mem) => {
       if (mem.nodeType === 'insight') {
@@ -63,30 +63,36 @@ export class TimelineService {
       };
     }));
 
-    const pendingEvents = await TimelineRepository.getPendingMemories(userId, 10);
-    const pendingMemories = pendingEvents.map((evt: any) => {
-      let content = 'Processing...';
-      const payload = evt.payload;
-      if (payload) {
-        if (payload.type === 'text') content = payload.content;
-        else if (payload.type === 'audio') content = 'Audio Note (Processing...)';
-        else if (payload.type === 'image') content = 'Image (Processing...)';
-        else if (payload.type === 'url') content = `Link: ${payload.sourceUrl || ''}`;
-        else if (payload.type === 'pdf') content = `Document: ${payload.originalFilename || ''}`;
-      }
-      return {
-        id: evt.id,
-        nodeType: 'raw_thought',
-        content,
-        metadata: { status: evt.processing_status, progress: payload?.progress  },
-        createdAt: typeof evt.created_at === 'string' && !evt.created_at.endsWith('Z') ? new Date(evt.created_at + 'Z') : new Date(evt.created_at),
-        updatedAt: typeof evt.created_at === 'string' && !evt.created_at.endsWith('Z') ? new Date(evt.created_at + 'Z') : new Date(evt.created_at),
-        project: null,
-        rawContent: null,
-        sentiment: 'neutral',
-        moodScore: 5,
-      };
-    });
+    let pendingMemories: any[] = [];
+    if (!cursor) {
+      const pendingEvents = await TimelineRepository.getPendingMemories(userId, 10);
+      pendingMemories = pendingEvents.map((evt: any) => {
+        let content = 'Processing...';
+        const payload = evt.payload;
+        if (payload) {
+          if (payload.type === 'text') content = payload.content;
+          else if (payload.type === 'audio') content = 'Audio Note (Processing...)';
+          else if (payload.type === 'image') content = 'Image (Processing...)';
+          else if (payload.type === 'url') content = `Link: ${payload.sourceUrl || ''}`;
+          else if (payload.type === 'pdf') content = `Document: ${payload.originalFilename || ''}`;
+        }
+        return {
+          id: evt.id,
+          nodeType: 'raw_thought',
+          content,
+          metadata: { status: evt.processing_status, progress: payload?.progress  },
+          createdAt: typeof evt.created_at === 'string' && !evt.created_at.endsWith('Z') ? new Date(evt.created_at + 'Z') : new Date(evt.created_at),
+          updatedAt: typeof evt.created_at === 'string' && !evt.created_at.endsWith('Z') ? new Date(evt.created_at + 'Z') : new Date(evt.created_at),
+          project: null,
+          rawContent: null,
+          sentiment: 'neutral',
+          moodScore: 5,
+          type: payload?.type,
+          mediaBase64: payload?.mediaBase64,
+          mimeType: payload?.mimeType,
+        };
+      });
+    }
 
     const timeline = [...pendingMemories, ...enriched].sort((a, b) => 
       new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime()

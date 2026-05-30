@@ -1,17 +1,26 @@
 import { db } from '../../db/index.js';
 import { nodes, edges } from '../../db/schema.js';
-import { eq, and, desc, sql } from 'drizzle-orm';
+import { eq, and, desc, sql, lt } from 'drizzle-orm';
 
 export class ProjectsRepository {
-  static async getProjects(userId: string) {
+  static async getProjects(userId: string, limit = 50, cursor?: string | null) {
+    let whereClause = and(eq(nodes.nodeType, 'project'), eq(nodes.userId, userId));
+    if (cursor) {
+      whereClause = and(whereClause, lt(nodes.createdAt, new Date(cursor)));
+    }
     return await db
       .select({ id: nodes.id, content: nodes.content, createdAt: nodes.createdAt })
       .from(nodes)
-      .where(and(eq(nodes.nodeType, 'project'), eq(nodes.userId, userId)))
-      .orderBy(desc(nodes.createdAt));
+      .where(whereClause)
+      .orderBy(desc(nodes.createdAt))
+      .limit(limit);
   }
 
-  static async getLinkedMemories(projectId: string, userId: string) {
+  static async getLinkedMemories(projectId: string, userId: string, limit = 20, cursor?: string | null) {
+    let whereTime = sql`1=1`;
+    if (cursor) {
+      whereTime = sql`n.created_at < ${new Date(cursor).toISOString()}`;
+    }
     return await db.execute(sql`
       SELECT n.id, n.content, n.created_at
       FROM edges e
@@ -20,8 +29,9 @@ export class ProjectsRepository {
       AND n.node_type = 'memory'
       AND e.relation_type = 'belongs_to'
       AND n.user_id = ${userId}
+      AND ${whereTime}
       ORDER BY n.created_at DESC
-      LIMIT 20
+      LIMIT ${limit}
     `);
   }
 
