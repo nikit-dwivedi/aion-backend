@@ -34,7 +34,6 @@ export class TimelineService {
           strength = meta?.strength || strength;
           relatedEntityOrProject = meta?.relatedEntityOrProject || null;
         }
-
         return {
           ...mem,
           content,
@@ -77,11 +76,11 @@ export class TimelineService {
       }
       return {
         id: evt.id,
-        nodeType: 'memory',
+        nodeType: 'raw_thought',
         content,
-        metadata: { status: evt.processing_status, progress: payload?.progress },
-        createdAt: evt.created_at,
-        updatedAt: evt.created_at,
+        metadata: { status: evt.processing_status, progress: payload?.progress  },
+        createdAt: typeof evt.created_at === 'string' && !evt.created_at.endsWith('Z') ? new Date(evt.created_at + 'Z') : new Date(evt.created_at),
+        updatedAt: typeof evt.created_at === 'string' && !evt.created_at.endsWith('Z') ? new Date(evt.created_at + 'Z') : new Date(evt.created_at),
         project: null,
         rawContent: null,
         sentiment: 'neutral',

@@ -8,6 +8,7 @@ export class TimelineController {
     if (!userId) throw new AppError('Unauthorized', 401);
 
     const memories = await TimelineService.getTimeline(userId);
+    
     res.json({ memories });
   }
 

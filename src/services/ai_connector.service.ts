@@ -264,8 +264,9 @@ export class AIConnectorService {
         contents = options.systemInstruction ? `${options.systemInstruction}\n\n${options.prompt}` : options.prompt;
       }
 
+      const modelName = process.env.LLM_PROVIDER === 'gemini' ? (process.env.LLM_MODEL || 'gemini-3.5-flash') : 'gemini-3.5-flash';
       const result = await this.geminiClient!.models.generateContent({
-        model: process.env.LLM_MODEL || 'gemini-2.5-flash',
+        model: modelName,
         contents: contents,
       });
       return {
@@ -282,7 +283,6 @@ export class AIConnectorService {
       if (options.mediaBuffer) {
         let mime = options.mimeType || 'image/jpeg';
         const isImage = mime.startsWith('image/');
-        
         if (isImage) {
           const messages: any[] = [];
           if (options.systemInstruction) {
@@ -310,8 +310,10 @@ export class AIConnectorService {
               completionTokens: result.usage?.completion_tokens ?? 0
             }
           };
+        } else if (mime.startsWith('audio/')) {
+          throw new Error("OpenAI audio processing not supported in this connector. Triggering fallback.");
         } else {
-          console.warn("[AIConnector] OpenAI fallback lacks direct inline base64 audio processing. Attempting standard text query.");
+          console.warn("[AIConnector] OpenAI fallback lacks direct inline base64 media processing for this type. Attempting standard text query.");
         }
       }
 
